@@ -1,0 +1,56 @@
+[package]
+name = "miraicloud"
+version = "0.1.0"
+description = "The mirai.cloud SDK for Rust: Streams (the Sui checkpoint stream: ordered, resumable from any checkpoint, history from the Sui archive) and Sui-native delegation"
+edition = "2024"
+license = "Apache-2.0"
+homepage = "https://mirai.cloud"
+documentation = "https://docs.mirai.cloud"
+keywords = ["sui", "blockchain", "checkpoints", "stream", "delegation"]
+categories = ["api-bindings", "cryptography::cryptocurrencies"]
+# Not on crates.io yet.
+publish = false
+
+[features]
+default = ["keypair"]
+# `KeypairSigner`: Ed25519 and Secp256r1 keys (Sui's `suiprivkey` format
+# included), signing through `sui-crypto`.
+keypair = ["dep:sui-crypto", "dep:sui-sdk-types"]
+
+[dependencies]
+base64 = "0.22"
+blake2 = "0.10"
+bytes = "1"
+futures = "0.3"
+getrandom = "0.2"
+http = "1"
+httpdate = "1"
+prost = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "zstd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sui-crypto = { version = "0.4.0", optional = true, features = ["ed25519", "secp256r1", "bech32"] }
+sui-rpc = "0.4.0"
+sui-sdk-types = { version = "0.4.0", optional = true, features = ["hash", "serde"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tonic = { version = "0.14", default-features = false }
+tracing = "0.1"
+
+[dev-dependencies]
+anyhow = "1"
+axum = "0.8"
+sui-crypto = { version = "0.4.0", features = ["ed25519", "secp256r1"] }
+sui-sdk-types = { version = "0.4.0", features = ["hash", "serde"] }
+zstd = "0.13"
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+[[bench]]
+name = "decode"
+harness = false

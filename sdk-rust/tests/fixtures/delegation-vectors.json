@@ -1,0 +1,84 @@
+{
+  "description": "Delegation vectors: Ed25519 keys from seeds [1;32] (owner), [2;32] (agent), [3;32] (sub-agent); check with now = 2026-11-06T00:00:00Z and audience https://api.mainnet.mirai.cloud",
+  "now": 1793923200000,
+  "audience": "https://api.mainnet.mirai.cloud",
+  "keys": {
+    "owner": {
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "address": "0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f"
+    },
+    "agent": {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "address": "0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c"
+    },
+    "subAgent": {
+      "seed": "0303030303030303030303030303030303030303030303030303030303030303",
+      "address": "0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066"
+    }
+  },
+  "delegations": [
+    {
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nsubject: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nparent: -\nscopes: stream:read rpc:read keys:write\nnetworks: mainnet\norigins: -\nexpires: 2030-01-01T00:00:00Z\nlimits: monthlyRequests=1000000 monthlyBytes=-\nnonce: 00112233445566778899aabbccddeeff",
+      "id": "k2lsthwa3hzgafkl",
+      "signature": "ABFWqMUPvLKwW+QVyKKHPPKIn5OY+IF+H3+pmP1H5Gxe9QqKIC76x/0buQzsnOVK1Mrlyxgb09Sz3tqxpqLcnwyKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXA=="
+    },
+    {
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nsubject: 0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066\nparent: k2lsthwa3hzgafkl\nscopes: stream:read\nnetworks: mainnet\norigins: -\nexpires: 2029-06-01T12:30:15Z\nlimits: monthlyRequests=5000 monthlyBytes=1000000000\nnonce: ffeeddccbbaa99887766554433221100",
+      "id": "nqruuuoa5mtk2vd4",
+      "signature": "AFBwt9+4N9a2EwpScmkKEMj2qiSydQqN/Gk0i3V2bwVGKNZaITS9KUKiJ3zI1AdsVllcve0ADZCRXOXz1gnqIQKBOXcOqH0XX1ajVGbDTH7My42KkbTuN6Jd9g9bj8mzlA=="
+    }
+  ],
+  "chain": "mcd1_AuoDbWlyYWkuY2xvdWQgZGVsZWdhdGlvbiB2MQphdWRpZW5jZTogaHR0cHM6Ly9hcGkubWFpbm5ldC5taXJhaS5jbG91ZAphY2NvdW50OiAweDI5ZGZiZjY4OGFiY2U3YWI0M2JiOGU3MGNhZTE1OGFlOTYxMTk2ZTcyMTQ0MGY1MTU0ODJmOGJhMTY4NDM5MGYKaXNzdWVyOiAweDI5ZGZiZjY4OGFiY2U3YWI0M2JiOGU3MGNhZTE1OGFlOTYxMTk2ZTcyMTQ0MGY1MTU0ODJmOGJhMTY4NDM5MGYKc3ViamVjdDogMHg3Nzk5ZWE4MDU5NGMzNTY0NDMyMTE0ODQ4NTIzOGM3YTdhMWM2NTQ5ODA5ZTE3OTVlNjc0N2M2ZDRkYTI1MDRjCnBhcmVudDogLQpzY29wZXM6IHN0cmVhbTpyZWFkIHJwYzpyZWFkIGtleXM6d3JpdGUKbmV0d29ya3M6IG1haW5uZXQKb3JpZ2luczogLQpleHBpcmVzOiAyMDMwLTAxLTAxVDAwOjAwOjAwWgpsaW1pdHM6IG1vbnRobHlSZXF1ZXN0cz0xMDAwMDAwIG1vbnRobHlCeXRlcz0tCm5vbmNlOiAwMDExMjIzMzQ0NTU2Njc3ODg5OWFhYmJjY2RkZWVmZmEAEVaoxQ-8srBb5BXIooc88oifk5j4gX4ff6mY_UfkbF71CoogLvrH_Ru5DOyc5UrUyuXLGBvT1LPe2rGmotyfDIqI4910CfGV_VLbLTy6XXLKZwm_HZQSG_N0iAG0D29c6wNtaXJhaS5jbG91ZCBkZWxlZ2F0aW9uIHYxCmF1ZGllbmNlOiBodHRwczovL2FwaS5tYWlubmV0Lm1pcmFpLmNsb3VkCmFjY291bnQ6IDB4MjlkZmJmNjg4YWJjZTdhYjQzYmI4ZTcwY2FlMTU4YWU5NjExOTZlNzIxNDQwZjUxNTQ4MmY4YmExNjg0MzkwZgppc3N1ZXI6IDB4Nzc5OWVhODA1OTRjMzU2NDQzMjExNDg0ODUyMzhjN2E3YTFjNjU0OTgwOWUxNzk1ZTY3NDdjNmQ0ZGEyNTA0YwpzdWJqZWN0OiAweGQ2NGZlNjQ1MjIxNjlhOGEyNmZlZDVhZTJmOWEzYzc2MzYzYTE4NjUwYTU4MDM3OWYyM2RkZjY0YzI1ODcwNjYKcGFyZW50OiBrMmxzdGh3YTNoemdhZmtsCnNjb3Blczogc3RyZWFtOnJlYWQKbmV0d29ya3M6IG1haW5uZXQKb3JpZ2luczogLQpleHBpcmVzOiAyMDI5LTA2LTAxVDEyOjMwOjE1WgpsaW1pdHM6IG1vbnRobHlSZXF1ZXN0cz01MDAwIG1vbnRobHlCeXRlcz0xMDAwMDAwMDAwCm5vbmNlOiBmZmVlZGRjY2JiYWE5OTg4Nzc2NjU1NDQzMzIyMTEwMGEAUHC337g31rYTClJyaQoQyPaqJLJ1Co38aTSLdXZvBUYo1lohNL0pQqInfMjUB2xWWVy97QANkJFc5fPWCeohAoE5dw6ofRdfVqNUZsNMfszLjYqRtO43ol32D1uPybOU",
+  "ancestors": [
+    "nqruuuoa5mtk2vd4",
+    "k2lsthwa3hzgafkl"
+  ],
+  "invalidSecondLinks": [
+    {
+      "name": "scopes wider than the parent",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nsubject: 0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066\nparent: k2lsthwa3hzgafkl\nscopes: stream:read rpc:write\nnetworks: mainnet\norigins: -\nexpires: 2029-06-01T12:30:15Z\nlimits: monthlyRequests=5000 monthlyBytes=1000000000\nnonce: ffeeddccbbaa99887766554433221100"
+    },
+    {
+      "name": "expiry later than the parent",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nsubject: 0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066\nparent: k2lsthwa3hzgafkl\nscopes: stream:read\nnetworks: mainnet\norigins: -\nexpires: 2031-01-01T00:00:00Z\nlimits: monthlyRequests=5000 monthlyBytes=1000000000\nnonce: ffeeddccbbaa99887766554433221100"
+    },
+    {
+      "name": "limit looser than the parent",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nsubject: 0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066\nparent: k2lsthwa3hzgafkl\nscopes: stream:read\nnetworks: mainnet\norigins: -\nexpires: 2029-06-01T12:30:15Z\nlimits: monthlyRequests=2000000 monthlyBytes=-\nnonce: ffeeddccbbaa99887766554433221100"
+    },
+    {
+      "name": "wrong parent",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nsubject: 0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066\nparent: aaaaaaaaaaaaaaaa\nscopes: stream:read\nnetworks: mainnet\norigins: -\nexpires: 2029-06-01T12:30:15Z\nlimits: monthlyRequests=5000 monthlyBytes=1000000000\nnonce: ffeeddccbbaa99887766554433221100"
+    },
+    {
+      "name": "issuer is not the previous subject",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066\nsubject: 0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066\nparent: k2lsthwa3hzgafkl\nscopes: stream:read\nnetworks: mainnet\norigins: -\nexpires: 2029-06-01T12:30:15Z\nlimits: monthlyRequests=5000 monthlyBytes=1000000000\nnonce: ffeeddccbbaa99887766554433221100"
+    },
+    {
+      "name": "other audience",
+      "message": "mirai.cloud delegation v1\naudience: https://example.com\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nsubject: 0xd64fe64522169a8a26fed5ae2f9a3c76363a18650a580379f23ddf64c2587066\nparent: k2lsthwa3hzgafkl\nscopes: stream:read\nnetworks: mainnet\norigins: -\nexpires: 2029-06-01T12:30:15Z\nlimits: monthlyRequests=5000 monthlyBytes=1000000000\nnonce: ffeeddccbbaa99887766554433221100"
+    }
+  ],
+  "invalidMessages": [
+    {
+      "name": "scopes out of order",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nsubject: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nparent: -\nscopes: rpc:read stream:read keys:write\nnetworks: mainnet\norigins: -\nexpires: 2030-01-01T00:00:00Z\nlimits: monthlyRequests=1000000 monthlyBytes=-\nnonce: 00112233445566778899aabbccddeeff"
+    },
+    {
+      "name": "trailing newline",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nsubject: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nparent: -\nscopes: stream:read rpc:read keys:write\nnetworks: mainnet\norigins: -\nexpires: 2030-01-01T00:00:00Z\nlimits: monthlyRequests=1000000 monthlyBytes=-\nnonce: 00112233445566778899aabbccddeeff\n"
+    },
+    {
+      "name": "milliseconds in expiry",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nsubject: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nparent: -\nscopes: stream:read rpc:read keys:write\nnetworks: mainnet\norigins: -\nexpires: 2030-01-01T00:00:00.000Z\nlimits: monthlyRequests=1000000 monthlyBytes=-\nnonce: 00112233445566778899aabbccddeeff"
+    },
+    {
+      "name": "uppercase address",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29DFBF688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nsubject: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nparent: -\nscopes: stream:read rpc:read keys:write\nnetworks: mainnet\norigins: -\nexpires: 2030-01-01T00:00:00Z\nlimits: monthlyRequests=1000000 monthlyBytes=-\nnonce: 00112233445566778899aabbccddeeff"
+    },
+    {
+      "name": "missing nonce",
+      "message": "mirai.cloud delegation v1\naudience: https://api.mainnet.mirai.cloud\naccount: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nissuer: 0x29dfbf688abce7ab43bb8e70cae158ae961196e721440f515482f8ba1684390f\nsubject: 0x7799ea80594c35644321148485238c7a7a1c6549809e1795e6747c6d4da2504c\nparent: -\nscopes: stream:read rpc:read keys:write\nnetworks: mainnet\norigins: -\nexpires: 2030-01-01T00:00:00Z\nlimits: monthlyRequests=1000000 monthlyBytes=-"
+    }
+  ]
+}
