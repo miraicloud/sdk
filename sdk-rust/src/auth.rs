@@ -55,6 +55,8 @@ use crate::delegation::{self, Chain, Scope, Signer, SignerError, hex, now_ms, ra
 /// Exchanged tokens live this long unless [`TokenOptions::expires_in`] says
 /// otherwise (never longer than the chain).
 pub const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
+/// The shortest lifetime the exchange grants.
+pub const MIN_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 /// The longest lifetime the exchange grants.
 pub const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(86_400);
 /// The token exchange's path.
@@ -85,7 +87,8 @@ pub enum Error {
         tag: String,
         message: String,
     },
-    /// The API could not be reached or kept answering `429`/`5xx`.
+    /// The API could not be reached or kept answering `429`, `502`, `503`
+    /// or `504`.
     #[error("unavailable: {0}")]
     Unavailable(String),
 }
@@ -164,7 +167,8 @@ fn jittered(d: Duration) -> Duration {
     d.mul_f64(0.5 + 0.5 * unit)
 }
 
-/// Signed `POST`s to the management API, retrying `429`/`5xx`.
+/// Signed `POST`s to the management API, retrying `429`, `502`, `503` and
+/// `504`.
 struct Api {
     client: reqwest::Client,
     base: String,
@@ -317,8 +321,9 @@ impl Api {
 /// How a [`TokenSource`] exchanges and renews.
 #[derive(Clone, Debug)]
 pub struct TokenOptions {
-    /// The tokens' lifetime (default [`DEFAULT_TOKEN_LIFETIME`], at most
-    /// [`MAX_TOKEN_LIFETIME`]; never beyond the chain's expiry).
+    /// The tokens' lifetime (default [`DEFAULT_TOKEN_LIFETIME`], from
+    /// [`MIN_TOKEN_LIFETIME`] to [`MAX_TOKEN_LIFETIME`]; never beyond the
+    /// chain's expiry).
     pub expires_in: Option<Duration>,
     /// Narrow the tokens' scopes (default: the chain's).
     pub scopes: Option<Vec<Scope>>,
@@ -327,7 +332,8 @@ pub struct TokenOptions {
     /// lifetime).
     pub refresh_margin: Duration,
     pub refresh_fraction: f64,
-    /// Tries per exchange on `429`/`5xx`/network errors (default 5).
+    /// Tries per exchange on `429`, `502`, `503`, `504` and network errors
+    /// (default 5).
     pub max_attempts: u32,
     /// Per request (default 10 s).
     pub timeout: Duration,
@@ -449,10 +455,11 @@ impl TokenSource {
             )));
         }
         if let Some(d) = options.expires_in
-            && (d < Duration::from_secs(1) || d > MAX_TOKEN_LIFETIME)
+            && (d < MIN_TOKEN_LIFETIME || d > MAX_TOKEN_LIFETIME)
         {
             return Err(Error::Config(format!(
-                "expires_in: 1 s to {} s",
+                "expires_in: {} s to {} s",
+                MIN_TOKEN_LIFETIME.as_secs(),
                 MAX_TOKEN_LIFETIME.as_secs()
             )));
         }
@@ -681,7 +688,7 @@ impl TokenSource {
 }
 
 /// Revoke delegation `id`: every token below it is refused from then on
-/// (within a minute). `chain`: a chain that contains `id` (it proves which
+/// (everywhere within 45 s; open streams end within another 30 s). `chain`: a chain that contains `id` (it proves which
 /// account the delegation belongs to; expired delegations can be revoked
 /// too). `signer`: the account's owner, or the subject of the delegation or
 /// of one above it.

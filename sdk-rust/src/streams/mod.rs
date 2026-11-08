@@ -5,12 +5,12 @@
 //! A [`Subscription`] yields [`Event`]s strictly in sequence order, without
 //! duplicates, from any starting point:
 //!
-//! - the stream serves live checkpoints and the last few minutes; anything
+//! - the stream serves live checkpoints and the most recent ones; anything
 //!   older is read from the archive (`archive.mainnet.sui.io`, every
 //!   checkpoint since genesis) by this client, then the stream takes over,
 //!   without holes or duplicates;
-//! - reconnects from the cursor with exponential backoff (1 s doubling to
-//!   30 s, at least the server's `Retry-After`), and treats 45 s without
+//! - reconnects from the cursor with jittered exponential backoff (1 s
+//!   doubling to 30 s, at least the server's `Retry-After`), and treats 45 s without
 //!   bytes (keepalives arrive every 15 s) as a dead connection;
 //! - surfaces checkpoints that cannot be delivered as [`Event::Gap`]; the
 //!   subscription then continues after the gap.
@@ -74,8 +74,8 @@ pub use archive::DEFAULT_ARCHIVE_URL;
 pub enum Error {
     #[error("invalid configuration: {0}")]
     Config(String),
-    /// The stream refused the request for good: 400, 401, 403, 404, or 429
-    /// over quota (`QuotaExceeded`).
+    /// The stream refused the request for good: 400, 401, 403, 404 (until
+    /// the stream has once answered), or 429 over quota (`QuotaExceeded`).
     #[error("stream rejected the request: HTTP {status}: {body}")]
     Http { status: u16, body: String },
     /// No token: the exchange refused the delegation chain (revoked,

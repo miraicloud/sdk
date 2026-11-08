@@ -21,6 +21,7 @@ export const SCOPES = [
 ] as const;
 export type Scope = (typeof SCOPES)[number];
 
+/** Only mainnet is offered; testnet stays because tokens and delegations encode networks (token bit i is NETWORKS[i]). */
 export const NETWORKS = ["mainnet", "testnet"] as const;
 export type Network = (typeof NETWORKS)[number];
 
@@ -38,12 +39,16 @@ export const UNLIMITED: Limits = { monthlyRequests: null, monthlyBytes: null };
 /**
  * An account. `id` is its Sui address (`0x` + 64 lowercase hex); the owner's
  * first signed request creates it. `label`: an operator's note; null by default.
+ * `maxStreams`: how many checkpoint streams the account may hold open at once,
+ * set by an operator; null: the default for accounts without one (the free
+ * tier's).
  */
 export interface Account {
   readonly id: string;
   readonly label: string | null;
   readonly status: AccountStatus;
   readonly limits: Limits;
+  readonly maxStreams: number | null;
   readonly createdAt: number;
 }
 

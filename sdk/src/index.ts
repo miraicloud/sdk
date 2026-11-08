@@ -6,7 +6,7 @@
  * constants and `Data` errors (no `Schema`); `@miraicloud/sdk/contract`
  * holds the `HttpApi` definitions; `@miraicloud/sdk/client` the typed
  * clients derived from them; `@miraicloud/sdk/streams` the checkpoint stream
- * and the event streams as Effect `Stream`s.
+ * as an Effect `Stream`.
  */
 
 export { Auth, DEFAULT_ENDPOINT, MiraiCloud, MiraiCloudRead } from "./client.js";

@@ -17,7 +17,7 @@ import { HEADERS } from "@miraicloud/core/signed";
 import { fromSuiSigner } from "@miraicloud/core/signer";
 import { type CheckpointItem, type CheckpointStreamOptions, Diagnostic, layerFetch, MiraiCloudStream, type RawCheckpointItem } from "../src/streams.js";
 import { ArchiveError, archiveHistory, BCS_PATHS, CANONICAL, DEFAULT, effective, fillObjectTypes, type HistoryItem, type HistorySource, plan, prune } from "../src/streams/archive.js";
-import { decoded, fetchDecodesZstd, httpSource, nativeZstdDecoder, raw, type SourceOptions } from "../src/streams/checkpoints.js";
+import { decoded, fetchDecodesZstd, httpSource, keepFields, masked, nativeZstdDecoder, raw, type SourceOptions } from "../src/streams/checkpoints.js";
 import { type Decoder, drive, type LiveSource, Retry, TooOld } from "../src/streams/driver.js";
 import { FrameParser, splitResponse } from "../src/streams/frame.js";
 import { EXCLUDED_PATHS, resolveMask } from "../src/streams/mask.js";
@@ -107,6 +107,25 @@ describe("mask", () => {
     for (const b of BCS_PATHS) expect(ok([b])).toEqual([b]);
     expect(error(["transactions.efects"])).toMatch(/invalid/);
     expect(error(["objects.objects.json"])).toMatch(/excluded/);
+  });
+
+  test("masked decoding skips the fields the mask doesn't reach, with the same result as decoding everything", () => {
+    const cp = GrpcTypes.Checkpoint.create({
+      sequenceNumber: 7n,
+      digest: "d7",
+      summary: { sequenceNumber: 7n, timestamp: { seconds: 1n, nanos: 2 }, epoch: 3n },
+      transactions: [{ digest: "t".repeat(5000) }, { digest: "u" }],
+      objects: { objects: [{ objectId: "0x1", version: 4n }] },
+    });
+    const bytes = GrpcTypes.Checkpoint.toBinary(cp);
+    for (const paths of [["sequence_number", "summary.timestamp"], ["summary"], ["transactions.digest"], ["digest", "objects.objects.version"]]) {
+      const item = masked(decoded, paths).frame(7n, bytes);
+      expect(item._tag === "Checkpoint" && item.checkpoint).toEqual(prune(cp, paths));
+    }
+    // Only fields 1 (sequence_number) and 3 (summary) are kept, as bytes, in order.
+    expect(GrpcTypes.Checkpoint.fromBinary(keepFields(bytes, new Set([1, 3])))).toEqual(GrpcTypes.Checkpoint.create({ sequenceNumber: 7n, summary: cp.summary }));
+    // Truncated input is refused (a broken connection), not decoded short.
+    expect(() => masked(decoded, ["summary"]).frame(7n, bytes.subarray(0, bytes.length - 3))).toThrow(/undecodable/);
   });
 
   test.skipIf(!hasServer)("excluded paths match the server", async () => {

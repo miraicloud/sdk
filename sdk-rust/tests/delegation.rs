@@ -376,6 +376,8 @@ async fn delegate_as_owner_uses_the_defaults() {
     assert_eq!(d.subject, agent().address());
     assert_eq!(d.parent, None);
     let mut expected = Rights::owner();
+    // Mainnet only (testnet isn't offered).
+    expected.networks = vec![Network::Mainnet];
     // 30 days, rounded down to the second.
     expected.expires_at = Some((now + 30 * DAY) / 1000 * 1000);
     assert_eq!(d.rights, expected);

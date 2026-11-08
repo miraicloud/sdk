@@ -25,6 +25,8 @@ export const Account = Schema.Struct({
   label: Schema.NullOr(Schema.String),
   status: Schema.Literals(M.ACCOUNT_STATUSES),
   limits: Limits,
+  /** Concurrent checkpoint streams allowed (set by an operator); null: the default. */
+  maxStreams: Schema.NullOr(Schema.Number),
   createdAt: Schema.Number,
 }) satisfies Exactly<M.Account>;
 

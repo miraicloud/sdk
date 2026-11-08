@@ -223,7 +223,8 @@ pub struct Rights {
 
 impl Rights {
     /// What an account's owner holds: every scope but `keys:write`, every
-    /// network, no expiry, no limits (the defaults of a root delegation).
+    /// network, no expiry, no limits (the defaults of a root delegation,
+    /// but for its networks: mainnet).
     pub fn owner() -> Self {
         Rights {
             scopes: Scope::ALL
@@ -908,9 +909,18 @@ pub enum Expiry {
     At(i64),
 }
 
+/// Networks left out: mainnet, or the issuer's if it can't grant mainnet.
+fn default_networks(issuer: &[Network]) -> Vec<Network> {
+    if issuer.contains(&Network::Mainnet) {
+        vec![Network::Mainnet]
+    } else {
+        issuer.to_vec()
+    }
+}
+
 /// What to delegate; anything left out is the issuer's (the owner's: every
-/// scope but `keys:write`, every network), the expiry min(the issuer's,
-/// 30 days).
+/// scope but `keys:write`), the networks mainnet, the expiry min(the
+/// issuer's, 30 days).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DelegateRequest {
     /// The agent's Sui address.
@@ -1062,7 +1072,10 @@ pub async fn delegate_at<S: Signer + ?Sized>(
         parent: parent_id,
         rights: Rights {
             scopes: request.scopes.clone().unwrap_or(rights.scopes),
-            networks: request.networks.clone().unwrap_or(rights.networks),
+            networks: request
+                .networks
+                .clone()
+                .unwrap_or_else(|| default_networks(&rights.networks)),
             origins: request
                 .origins
                 .as_ref()

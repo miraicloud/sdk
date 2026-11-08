@@ -2,7 +2,7 @@
   "name": "@miraicloud/sdk",
   "version": "0.1.0",
   "private": true,
-  "description": "The mirai.cloud API from TypeScript: Sui data over HTTP, the checkpoint stream and event streams, accounts, API keys and usage, with Sui-signed requests. Built on Effect.",
+  "description": "The mirai.cloud API from TypeScript: Sui data over HTTP, the checkpoint stream, accounts, API keys and usage, with Sui-signed requests. Built on Effect.",
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,

@@ -1,6 +1,6 @@
 # @miraicloud/sdk
 
-The [mirai.cloud](https://mirai.cloud) API from TypeScript: Sui transactions, objects, checkpoints and validators as typed JSON, Streams (the checkpoint stream and the event streams), plus your account, API keys and usage. Built on [Effect](https://effect.website).
+The [mirai.cloud](https://mirai.cloud) API from TypeScript: Sui transactions, objects, checkpoints and validators as typed JSON, the checkpoint stream, plus your account, API keys and usage. Built on [Effect](https://effect.website).
 
 **Your account is your Sui address.** There's no sign-up and no password: you authorize management calls by signing each request with your address's key, as a Sui personal message. Your first signed request creates the account. API keys (`mc1_…`) are what your applications use. Each carries scopes, networks, browser origins, an expiry and limits; only the owner creates them. Agents get their own Sui address and a **delegation** instead: you sign a grant of part of your account to it, and it exchanges that for short-lived keys.
 
@@ -78,7 +78,8 @@ import { Effect, Redacted } from "effect";
 const program = Effect.gen(function* () {
   const sui = yield* MiraiCloudRead;
   const tx = yield* sui.transactions.get({ params: { digest: "2gb7RepDK8R2HCWhrxvJLfYsELNk2BAU5oJZyuEBzmYn" }, query: {} });
-  const gasCoin = tx.gas.object === null ? null : yield* sui.objects.get({ params: { objectId: tx.gas.object.objectId }, query: {} });
+  // The gas coin as it is now (`NotFound` once it's deleted or wrapped).
+  const gasCoin = tx.gas.object === null ? null : yield* sui.objects.get({ params: { objectId: tx.gas.object.objectId }, query: {} }).pipe(Effect.catchTag("NotFound", () => Effect.succeed(null)));
   const latest = yield* sui.checkpoints.get({ params: { checkpoint: "latest" }, query: {} });
   const { validators } = yield* sui.validators.list();
   return { status: tx.status, fee: tx.gas.used.fee, checkpoint: latest.sequenceNumber, top: validators[0]?.name };
@@ -108,10 +109,7 @@ The types are in `@miraicloud/sdk/sui`.
 
 ## Streams
 
-`MiraiCloudStream` delivers Sui data as it happens, as Effect `Stream`s, with an API key that has `stream:read`. There are two kinds:
-
-- **The checkpoint stream** (`checkpoints`, `rawCheckpoints`): every checkpoint, complete (every field the node serves, BCS included), as Sui's gRPC `Checkpoint` from `@mysten/sui/grpc`. You can start from any checkpoint since genesis.
-- **The event streams** (`events.checkpoints`, `events.transactions`): checkpoints, or only the transactions that match a filter, as the JSON `MiraiCloudRead` returns.
+`MiraiCloudStream` delivers Sui data as it happens, as Effect `Stream`s, with an API key that has `stream:read`: **the checkpoint stream** (`checkpoints`, `rawCheckpoints`), every checkpoint, complete (every field the node serves, BCS included), as Sui's gRPC `Checkpoint` from `@mysten/sui/grpc`. You can start from any checkpoint since genesis.
 
 ### The checkpoint stream
 
@@ -153,38 +151,6 @@ Items come strictly in order, each checkpoint once: `Checkpoint { seq, checkpoin
 
 **Runtimes.** The stream is zstd-compressed; Node 22.15 or later and Bun decode it out of the box.
 
-### The event streams
-
-```ts
-const program = Effect.gen(function* () {
-  const live = yield* Streams.MiraiCloudStream;
-  yield* live.events.transactions({ filter: { event: "0x2::coin", sender: ["0xa11ce…", "0xb0b…"] } }).pipe(
-    Stream.runForEach((e) =>
-      e._tag === "Transaction" ? Console.log(e.transaction.digest, e.transaction.status) : Console.log(e._tag, e.cursor),
-    ),
-  );
-});
-```
-
-| call | events |
-|---|---|
-| `live.events.checkpoints({ from?, cursor? })` | `Checkpoint { checkpoint, cursor }`, `Gap { from, to, cursor }` |
-| `live.events.transactions({ from?, cursor?, filter?, progress? })` | `Transaction { transaction, cursor }`, `Gap`, and with `progress: true` a `Progress { checkpoint, cursor }` after each checkpoint |
-
-**Filters** (`filter`): `sender`, `package` (a Move call into it), `function` (`pkg::module::fn`, or `pkg::module` for any of its functions), `event` (an event type, or a prefix of one: `pkg`, `pkg::module`, `pkg::module::Name`), `object` (a changed object), `address` (a balance change, or a changed object it owned or owns). Each takes one value or a list. A list matches any of its values; different fields must all match. Addresses may be short (`0x2`).
-
-**Staying connected.** A dropped, stalled or ended connection reconnects by itself and resumes right after the last event, with nothing missed or repeated. Every event has a `cursor`: store it to resume later with `{ cursor }`. With a filter that rarely matches, `progress: true` gives you a recent cursor anyway.
-
-**What can't be resumed:**
-- `Gap { from, to }`: those checkpoints won't be on the stream; it continues after them. If you need them, read them with `sui.checkpoints.get` (and their transactions with `sui.transactions.get`).
-- The stream fails with `Gone { from, oldest }` when you start (or resume) further back than it holds, a few minutes. Read `from` … `oldest - 1` with `sui.checkpoints.get` (immutable, so cached), then stream again with `{ from: oldest }`.
-
-Other refusals end the stream with the usual typed errors (`Unauthorized`, `Forbidden`, `Invalid`, `QuotaExceeded`); anything temporary is retried with backoff.
-
-**Differences from `MiraiCloudRead`:** a streamed transaction always has its `index` (its position in the checkpoint), and its events always carry `bcs` (the event's BCS bytes) next to their decoded `fields`; otherwise the JSON is what `sui.transactions.get` returns.
-
-**Without the SDK:** the event streams are plain Server-Sent Events at `GET /v1/checkpoints/stream` and `GET /v1/transactions/stream` (filters as repeated query parameters, e.g. `?sender=0x…&event=0x2::coin`), so `EventSource`, `curl -N` or any SSE library works. Events are `checkpoint` / `transaction` (JSON data), `gap` (`{ from, to }`; the server then closes) and `error` (`{ _tag, message }`; the server then closes, and you reconnect). Resume by sending the last `id` as `Last-Event-ID` (`EventSource` does this for you), or start at a checkpoint with `?from=`. A browser's `EventSource` can't set headers: pass a key restricted to your origins as `?api_key=`.
-
 ### Without Effect
 
 Every stream is an Effect `Stream`; `Stream.toAsyncIterable` turns one into a plain async iterable:
@@ -214,7 +180,9 @@ Leaving the loop (`break`, `return`, an exception) closes the connection.
 | `api.delegation.token({ payload: { chain, expiresIn?, scopes? } })` | exchange a delegation chain for a key, signed as the agent (`Auth.Delegated` does it for you) |
 | `api.delegation.revoke({ params: { id }, payload: { chain } })` | revoke a delegation |
 
-Errors are typed: each call fails with the classes in `@miraicloud/sdk/errors` (`Unauthorized`, `Forbidden`, `NotFound`, `Invalid`, `QuotaExceeded`, `RateLimited`, `Unavailable`), so you can handle them with `Effect.catchTag`. `RateLimited` (429, with `Retry-After`) is the account's caps on key creation and token exchanges: retry after the wait.
+Errors are typed: each call fails with the classes in `@miraicloud/sdk/errors` (`Unauthorized`, `Forbidden`, `NotFound`, `Invalid`, `QuotaExceeded`, `RateLimited`, `Unavailable`), so you can handle them with `Effect.catchTag`. `RateLimited` (429, with `Retry-After`) is a rate limit: 1,000 requests per 10 seconds per key and 2,000 per account, 120 a minute per IP address on the account and key calls, and the account's caps on key creation (10 a second, bursts of 100) and token exchanges (60 a minute). These calls don't retry it for you (`Auth.Delegated`'s exchanges do): wait for the `Retry-After` the response carries (60 seconds for the per-key, per-account and per-IP limits) and retry. An IP address that presents 20 invalid keys or signatures within a minute is refused (`RateLimited`) for a minute. `Forbidden` also covers the account's caps on how many keys it holds (10,000 live keys, 1,000 children per key, chains 8 deep).
+
+New accounts start on the free tier: 100,000 requests and 5 GB a month (`api.account.whoami()` shows the limits; `api.account.usage()` the usage).
 
 ## Entry points
 
@@ -222,7 +190,7 @@ Errors are typed: each call fails with the classes in `@miraicloud/sdk/errors` (
 |---|---|---|
 | `@miraicloud/sdk` | everything below, as namespaces | yes |
 | `@miraicloud/sdk/client` | `MiraiCloud`, `MiraiCloudRead`, `Auth`, `include`, `layer` (over any `HttpClient`), `layerFetch` | yes |
-| `@miraicloud/sdk/streams` | `MiraiCloudStream` (the checkpoint stream and the event streams), options, item and event types, `layer`, `layerFetch` | no |
+| `@miraicloud/sdk/streams` | `MiraiCloudStream` (the checkpoint stream), options, item types, `layer`, `layerFetch` | no |
 | `@miraicloud/sdk/contract` | the APIs' `HttpApi` definitions (`Api`, `ReadApi`) and schemas, to derive your own client or OpenAPI document | yes |
 | `@miraicloud/sdk/sui` | Sui types: `Transaction`, `SuiObject`, `Checkpoint`, `Validator`, `Owner`, `Amount`, … | no |
 | `@miraicloud/sdk/model` | types and constants: `KeyInfo`, `Account`, `Usage`, `SCOPES`, `NETWORKS`, … | no |

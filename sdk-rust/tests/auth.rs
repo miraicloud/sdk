@@ -528,11 +528,22 @@ async fn construction_checks_the_chain() {
     assert!(matches!(err, auth::Error::Delegation(_)), "{err}");
     // An endpoint with a trailing slash is the same origin.
     assert!(TokenSource::new(format!("{origin}/"), root, agent(), options()).is_ok());
+    // The exchange grants 60 s to 24 h.
+    for secs in [59, 86_401] {
+        let o = TokenOptions {
+            expires_in: Some(Duration::from_secs(secs)),
+            ..options()
+        };
+        assert!(
+            TokenSource::new(&origin, chain.clone(), sub(), o).is_err(),
+            "{secs}"
+        );
+    }
     let o = TokenOptions {
-        expires_in: Some(Duration::from_secs(86_401)),
+        expires_in: Some(Duration::from_secs(60)),
         ..options()
     };
-    assert!(TokenSource::new(&origin, chain, sub(), o).is_err());
+    assert!(TokenSource::new(&origin, chain, sub(), o).is_ok());
 }
 
 #[tokio::test]

@@ -55,14 +55,17 @@ describe("the format: test vectors", () => {
 });
 
 describe("delegate", () => {
-  test("owner defaults: every scope but keys:write, both networks, 30 days (to the second); sub-delegation within the parent; at most 8 deep", async () => {
+  test("owner defaults: every scope but keys:write, mainnet only, 30 days (to the second); sub-delegation within the parent; at most 8 deep", async () => {
     const owner = new Secp256r1Keypair();
     const agent = new Ed25519Keypair();
     const before = Date.now();
     const d1 = await Effect.runPromise(delegate(fromSuiSigner(owner), { to: agent.toSuiAddress() }));
     const parsed = Result.getOrThrow(parseDelegation(d1[0]!.message));
-    expect(parsed).toMatchObject({ audience: "https://api.mainnet.mirai.cloud", account: owner.toSuiAddress(), issuer: owner.toSuiAddress(), parent: null, networks: ["mainnet", "testnet"] });
+    expect(parsed).toMatchObject({ audience: "https://api.mainnet.mirai.cloud", account: owner.toSuiAddress(), issuer: owner.toSuiAddress(), parent: null, networks: ["mainnet"] });
     expect(parsed.scopes).not.toContain("keys:write");
+    // Naming testnet still works (it isn't offered, but the format keeps it).
+    const both = await Effect.runPromise(delegate(fromSuiSigner(owner), { to: agent.toSuiAddress(), networks: ["mainnet", "testnet"] }));
+    expect(Result.getOrThrow(parseDelegation(both[0]!.message)).networks).toEqual(["mainnet", "testnet"]);
     expect(parsed.expiresAt! % 1000).toBe(0);
     expect(parsed.expiresAt! - before).toBeLessThanOrEqual(DEFAULT_DELEGATION_LIFETIME_MS);
     expect(await verifyPersonalMessageSignature(new TextEncoder().encode(d1[0]!.message), d1[0]!.signature, { address: owner.toSuiAddress() })).toBeDefined();

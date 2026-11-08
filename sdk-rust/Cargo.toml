@@ -54,3 +54,12 @@ codegen-units = 4
 [[bench]]
 name = "decode"
 harness = false
+
+# These sign with `KeypairSigner`.
+[[test]]
+name = "auth"
+required-features = ["keypair"]
+
+[[test]]
+name = "delegation"
+required-features = ["keypair"]

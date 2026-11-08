@@ -344,7 +344,7 @@ export const checkChain = (chain: Chain, options: { readonly now: number; readon
   return Result.succeed({ links, account: links[0]!.delegation.account, leaf: links.at(-1)!.delegation, ancestors: links.map((l) => l.id).reverse() });
 };
 
-/** What to delegate; anything left out is the issuer's (the owner's: every scope but keys:write), the expiry min(the issuer's, 30 days). */
+/** What to delegate; anything left out is the issuer's (the owner's: every scope but keys:write), the networks mainnet, the expiry min(the issuer's, 30 days). */
 export interface DelegateRequest {
   /** The agent's Sui address. */
   readonly to: string;
@@ -362,6 +362,9 @@ export interface DelegateOptions {
   /** The chain the signer holds, to delegate part of it further; absent: the signer is the account's owner. */
   readonly parent?: Chain | undefined;
 }
+
+/** Networks left out: mainnet (testnet isn't offered), or the issuer's if it can't grant mainnet. */
+const defaultNetworks = (issuer: ReadonlyArray<Network>): ReadonlyArray<Network> => (issuer.includes("mainnet") ? ["mainnet"] : issuer);
 
 const OWNER_RIGHTS: Rights = { scopes: SCOPES.filter((s) => s !== "keys:write"), networks: NETWORKS, origins: [], expiresAt: null, limits: { monthlyRequests: null, monthlyBytes: null } };
 
@@ -402,7 +405,7 @@ export const delegate = (signer: Signer, request: DelegateRequest, options: Dele
       subject: to.value,
       parent: base.parent,
       scopes: request.scopes ?? base.rights.scopes,
-      networks: request.networks ?? base.rights.networks,
+      networks: request.networks ?? defaultNetworks(base.rights.networks),
       origins: (request.origins ?? base.rights.origins).map((o) => o.replace(/\/+$/, "")),
       expiresAt: expiresAt === null ? null : Math.floor(expiresAt / 1000) * 1000,
       limits: { monthlyRequests: request.limits?.monthlyRequests ?? base.rights.limits.monthlyRequests, monthlyBytes: request.limits?.monthlyBytes ?? base.rights.limits.monthlyBytes },

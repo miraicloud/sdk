@@ -1,7 +1,7 @@
 /**
  * `Auth.Delegated` against a local server: keys exchanged and refreshed
  * before they expire, one exchange however many callers, and streams that
- * move onto the fresh key without losing or repeating an event. (The
+ * move onto the fresh key without losing or repeating a checkpoint. (The
  * delegation format and `delegate` are tested in `@miraicloud/core`.)
  */
 
@@ -11,6 +11,7 @@ import { verifyPersonalMessageSignature } from "@mysten/sui/verify";
 import { decodeChain, delegate, delegationId, encodeChain, parseDelegation } from "@miraicloud/core/delegation";
 import { message as requestMessage } from "@miraicloud/core/signed";
 import { fromSuiSigner } from "@miraicloud/core/signer";
+import { GrpcTypes } from "@mysten/sui/grpc";
 import { Effect, Fiber, Result, Stream } from "effect";
 import { Auth, layerFetch, MiraiCloud } from "../src/client.js";
 import { layerFetch as streamsLayer, MiraiCloudStream } from "../src/streams.js";
@@ -56,20 +57,24 @@ describe("Auth.Delegated (a local server)", () => {
         used.push(bearer);
         const live = issued.find((t) => t.token === bearer && t.expiresAt > Date.now());
         if (live === undefined) return Response.json({ _tag: "Unauthorized", message: "this API key has expired" }, { status: 401 });
-        return Response.json({ as: "key", key: null, account: { id: `0x${"a".repeat(64)}`, label: null, status: "active", limits: { monthlyRequests: null, monthlyBytes: null }, createdAt: 0 } });
+        return Response.json({ as: "key", key: null, account: { id: `0x${"a".repeat(64)}`, label: null, status: "active", limits: { monthlyRequests: null, monthlyBytes: null }, maxStreams: null, createdAt: 0 } });
       }
-      if (url.pathname === "/v1/transactions/stream") {
+      if (url.pathname === "/v1/stream/checkpoints") {
         streamTokens.push(bearer);
-        // From Last-Event-ID (or 0), one event every 50 ms, never closing.
-        let n = Number((req.headers.get("last-event-id") ?? "0").split(":")[0]);
+        // From `from` (or 1), one checkpoint every 50 ms (each its own zstd frame), never closing.
+        let n = Number(url.searchParams.get("from") ?? "1") - 1;
         const stream = new ReadableStream<Uint8Array>({
           async pull(c) {
             await Bun.sleep(50);
             n++;
-            c.enqueue(new TextEncoder().encode(`id: ${n}:0\nevent: transaction\ndata: ${JSON.stringify({ digest: `d${n}`, index: 0 })}\n\n`));
+            const body = GrpcTypes.SubscribeCheckpointsResponse.toBinary({ cursor: BigInt(n), checkpoint: GrpcTypes.Checkpoint.create({ sequenceNumber: BigInt(n), digest: `d${n}` }) });
+            const frame = new Uint8Array(5 + body.length);
+            new DataView(frame.buffer).setUint32(1, body.length);
+            frame.set(body, 5);
+            c.enqueue(Bun.zstdCompressSync(frame));
           },
         });
-        return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+        return new Response(stream, { headers: { "content-type": "application/vnd.miraicloud.checkpoints.v1+proto", "content-encoding": "zstd" } });
       }
       return new Response("not found", { status: 404 });
     },
@@ -116,9 +121,9 @@ describe("Auth.Delegated (a local server)", () => {
       await Effect.runPromise(whoami);
       rateLimited = true;
       const t0 = Date.now();
-      // 50 events, ~2.5 s: past the refresh time, before the key expires.
+      // 50 checkpoints, ~2.5 s: past the refresh time, before the key expires.
       const events = await Effect.runPromise(
-        Effect.flatMap(MiraiCloudStream, (s) => s.events.transactions({ from: 0 }).pipe(Stream.take(50), Stream.runCollect)).pipe(Effect.provide(streamsLayer({ endpoint, auth }))),
+        Effect.flatMap(MiraiCloudStream, (s) => s.checkpoints({ from: 1 }).pipe(Stream.take(50), Stream.runCollect)).pipe(Effect.provide(streamsLayer({ endpoint, auth }))),
       );
       expect(events.length).toBe(50);
       expect(Date.now() - t0).toBeLessThan(2_900);
@@ -149,16 +154,16 @@ describe("Auth.Delegated (a local server)", () => {
     }
   });
 
-  test("a stream moves onto each fresh key before the old one expires: no event lost or repeated", async () => {
+  test("a stream moves onto each fresh key before the old one expires: no checkpoint lost or repeated", async () => {
     issued.length = 0;
     streamTokens.length = 0;
     lifetimeMs = 1_000;
     const agent = new Ed25519Keypair();
     const auth = Auth.Delegated({ chain: await chainFor(agent), signer: fromSuiSigner(agent) });
-    const events = await Effect.runPromise(
-      Effect.flatMap(MiraiCloudStream, (s) => s.events.transactions({ from: 0 }).pipe(Stream.take(40), Stream.runCollect)).pipe(Effect.provide(streamsLayer({ endpoint, auth }))),
+    const items = await Effect.runPromise(
+      Effect.flatMap(MiraiCloudStream, (s) => s.checkpoints({ from: 1 }).pipe(Stream.take(40), Stream.runCollect)).pipe(Effect.provide(streamsLayer({ endpoint, auth }))),
     );
-    const digests = [...events].flatMap((e) => (e._tag === "Transaction" ? [(e.transaction as { digest: string }).digest] : []));
+    const digests = [...items].flatMap((i) => (i._tag === "Checkpoint" ? [i.checkpoint.digest] : []));
     expect(digests).toEqual(Array.from({ length: 40 }, (_, i) => `d${i + 1}`));
     // Several connections, each with the key at hand then; never an expired one.
     expect(streamTokens.length).toBeGreaterThan(1);
