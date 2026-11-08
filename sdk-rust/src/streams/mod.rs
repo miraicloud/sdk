@@ -139,6 +139,7 @@ pub struct Client {
     start: Option<u64>,
     /// Prunes live checkpoints to the read mask (`None`: keep everything).
     mask: Option<Arc<sui_rpc::field::FieldMaskTree>>,
+    deadlines: driver::Deadlines,
 }
 
 impl std::fmt::Debug for Client {
@@ -160,6 +161,7 @@ pub struct Builder {
     archive_url: Option<String>,
     archive_concurrency: usize,
     stall_timeout: Duration,
+    progress_timeout: Duration,
 }
 
 /// Header names only: their values (an API key in `authorization`) never
@@ -176,6 +178,7 @@ impl std::fmt::Debug for Builder {
             .field("archive_url", &self.archive_url)
             .field("archive_concurrency", &self.archive_concurrency)
             .field("stall_timeout", &self.stall_timeout)
+            .field("progress_timeout", &self.progress_timeout)
             .finish()
     }
 }
@@ -191,6 +194,7 @@ impl Client {
             archive_url: Some(DEFAULT_ARCHIVE_URL.to_owned()),
             archive_concurrency: 2,
             stall_timeout: Duration::from_secs(45),
+            progress_timeout: driver::Deadlines::default().progress,
         }
     }
 
@@ -313,8 +317,21 @@ impl Builder {
         self
     }
 
+    /// Reconnect (resuming from the cursor) when a connection delivers no
+    /// checkpoint or gap for this long, even if keepalives still arrive
+    /// (default 60 s; Mainnet makes ~4 checkpoints a second). A server
+    /// that stays connected but stops sending checkpoints can't freeze a
+    /// subscription.
+    pub fn progress_timeout(mut self, timeout: Duration) -> Self {
+        self.progress_timeout = timeout;
+        self
+    }
+
     /// Validates the URLs and headers.
     pub fn build(self) -> Result<Client, Error> {
+        if self.progress_timeout.is_zero() {
+            return Err(Error::Config("progress timeout must be positive".into()));
+        }
         let paths = match &self.mask {
             Some(paths) => mask::resolve(paths).map_err(Error::Config)?,
             None => None,
@@ -334,6 +351,10 @@ impl Builder {
             history,
             start: self.start,
             mask: paths.as_deref().map(|p| Arc::new(mask::tree(p))),
+            deadlines: driver::Deadlines {
+                progress: self.progress_timeout,
+                ..driver::Deadlines::default()
+            },
         })
     }
 }
@@ -366,6 +387,7 @@ impl<E: driver::Item> Sub<E> {
             client.start,
             client.mask.clone(),
             tx,
+            client.deadlines,
         ));
         Self {
             rx,

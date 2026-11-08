@@ -303,6 +303,14 @@ pub(crate) trait History: Send + Sync + 'static {
 /// Checkpoints per `ListCheckpoints` page: the archive's maximum.
 pub(crate) const PAGE: u64 = 50;
 
+/// A `ListCheckpoints` call's first response, enforced here (tonic only
+/// sends `grpc-timeout` to the server).
+const CALL_DEADLINE: Duration = Duration::from_secs(120);
+/// Between two messages of one `ListCheckpoints` answer.
+const MESSAGE_DEADLINE: Duration = Duration::from_secs(60);
+/// One `GetServiceInfo` (the archive's tip).
+const TIP_DEADLINE: Duration = Duration::from_secs(5);
+
 /// `QueryEndReason::ItemLimit`: the server stopped at its own item limit; resume after the cursor.
 const ITEM_LIMIT: i32 = 1;
 
@@ -364,16 +372,25 @@ impl Archive {
             options.after = after.take();
             request.options = Some(options);
             let mut request = tonic::Request::new(request);
-            // Epoch-change checkpoints are 10-20 MB and slow to serve.
-            request.set_timeout(Duration::from_secs(120));
+            // Epoch-change checkpoints are 10-20 MB and slow to serve. The
+            // grpc-timeout header only asks the server; the client enforces
+            // its own deadlines (`CALL_DEADLINE`, `MESSAGE_DEADLINE`).
+            request.set_timeout(CALL_DEADLINE);
             // `ledger_client()` asks for zstd responses (~6x smaller).
-            let mut frames = client
-                .ledger_client()
-                .list_checkpoints(request)
-                .await?
-                .into_inner();
+            let mut frames = tokio::time::timeout(
+                CALL_DEADLINE,
+                client.ledger_client().list_checkpoints(request),
+            )
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("ListCheckpoints: no response"))??
+            .into_inner();
             let (mut reason, mut cursor) = (None, None);
-            while let Some(frame) = frames.message().await? {
+            while let Some(frame) = tokio::time::timeout(MESSAGE_DEADLINE, frames.message())
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded("ListCheckpoints: stalled mid-stream")
+                })??
+            {
                 if let Some(mut cp) = frame.checkpoint {
                     if fill {
                         fill_object_types(&mut cp);
@@ -513,10 +530,16 @@ impl History for Archive {
             let mut client = client.ok()?;
             for attempt in 0..3u32 {
                 let mut request = tonic::Request::new(GetServiceInfoRequest::default());
-                request.set_timeout(Duration::from_secs(30));
-                match client.ledger_client().get_service_info(request).await {
-                    Ok(r) => return r.into_inner().checkpoint_height,
-                    Err(s) => tracing::debug!("archive tip: {:?}: {}", s.code(), s.message()),
+                request.set_timeout(TIP_DEADLINE);
+                match tokio::time::timeout(
+                    TIP_DEADLINE,
+                    client.ledger_client().get_service_info(request),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => return r.into_inner().checkpoint_height,
+                    Ok(Err(s)) => tracing::debug!("archive tip: {:?}: {}", s.code(), s.message()),
+                    Err(_) => tracing::debug!("archive tip: no answer in {TIP_DEADLINE:?}"),
                 }
                 tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
             }

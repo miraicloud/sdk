@@ -418,7 +418,14 @@ export const archiveHistory = (options: ArchiveOptions): HistorySource => {
           }
         },
         catch: (cause) => new ArchiveError({ message: `checkpoints ${start}..${end - 1n}: ${String(cause)}`, cause }),
-      });
+      }).pipe(
+        // Enforced here too, whatever the transport does with `timeout`
+        // (interrupting aborts the call): nothing waits without a deadline.
+        Effect.timeoutOrElse({
+          duration: "150 seconds",
+          orElse: () => Effect.fail(new ArchiveError({ message: `checkpoints ${start}..${end - 1n}: no answer in 150 s` })),
+        }),
+      );
     });
 
   /** `[start, end)` as items: each checkpoint (filled and pruned) or `missing`. */
@@ -465,9 +472,9 @@ export const archiveHistory = (options: ArchiveOptions): HistorySource => {
     tip: getClient.pipe(
       Effect.flatMap(({ client: c }) =>
         Effect.tryPromise({
-          try: (signal) => c.ledgerService.getServiceInfo({}, { abort: signal, timeout: 30_000 }).response,
+          try: (signal) => c.ledgerService.getServiceInfo({}, { abort: signal, timeout: 5_000 }).response,
           catch: (cause) => new ArchiveError({ message: `archive tip: ${String(cause)}`, cause }),
-        }),
+        }).pipe(Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.fail(new ArchiveError({ message: "archive tip: no answer in 5 s" })) })),
       ),
       Effect.retry({ schedule: retrySchedule, times: 2 }),
       Effect.flatMap((info) =>

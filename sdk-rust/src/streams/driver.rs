@@ -6,6 +6,12 @@
 //! ring that moves on meanwhile. If the stream still answers `410`, this
 //! repeats. Checkpoints are decoded only after deduplication, so duplicates
 //! are never parsed.
+//!
+//! Nothing here waits without a deadline ([`Deadlines`]): connecting, the
+//! archive's tip, each archive item, and the connection itself, which must
+//! deliver a checkpoint or a gap (keepalives don't count) within
+//! `progress` or is dropped and resumed. A subscription can be slow, but it
+//! never stops moving silently.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +26,32 @@ use tokio::sync::mpsc;
 use crate::streams::archive::{History, Item as HistoryItem};
 use crate::streams::http::{ConnError, Source, StreamEvent};
 use crate::streams::{Checkpoint, Error, Event, RawEvent};
+
+/// How long each step may take before it counts as failed (and is retried).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Deadlines {
+    /// A connection that delivers no checkpoint or gap for this long is
+    /// dropped and resumed (keepalives don't count).
+    pub progress: Duration,
+    /// Opening a connection, through its first response.
+    pub connect: Duration,
+    /// The archive's tip; without it, a backfill runs up to the ring.
+    pub tip: Duration,
+    /// Each archive item; a page holds 50, and epoch-change checkpoints are
+    /// 10-20 MB.
+    pub history_item: Duration,
+}
+
+impl Default for Deadlines {
+    fn default() -> Self {
+        Deadlines {
+            progress: Duration::from_secs(60),
+            connect: Duration::from_secs(60),
+            tip: Duration::from_secs(15),
+            history_item: Duration::from_secs(150),
+        }
+    }
+}
 
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -130,12 +162,18 @@ async fn backfill<E: Item>(
     next: u64,
     oldest: u64,
     out: &mpsc::Sender<Result<E, Error>>,
+    deadlines: Deadlines,
 ) -> Option<(u64, bool)> {
-    // An unknown tip: up to the ring, as far as is known to be needed.
-    let end = history
-        .tip()
-        .await
-        .map_or(oldest, |tip| (tip + 1).max(oldest));
+    // An unknown tip (or one that doesn't answer in time): up to the ring,
+    // as far as is known to be needed.
+    let tip = match tokio::time::timeout(deadlines.tip, history.tip()).await {
+        Ok(tip) => tip,
+        Err(_) => {
+            tracing::warn!(after = ?deadlines.tip, "archive tip: no answer; backfilling up to the stream's oldest");
+            None
+        }
+    };
+    let end = tip.map_or(oldest, |tip| (tip + 1).max(oldest));
     tracing::info!(from = next, to = end - 1, "backfilling from the archive");
     let mut items = history.checkpoints(next..end);
     let mut next = next;
@@ -150,8 +188,12 @@ async fn backfill<E: Item>(
     }
     loop {
         let item = tokio::select! {
-            item = items.next() => item,
+            item = tokio::time::timeout(deadlines.history_item, items.next()) => item,
             _ = out.closed() => return None,
+        };
+        let Ok(item) = item else {
+            tracing::warn!(next, after = ?deadlines.history_item, "archive backfill: no answer; retrying");
+            return Some((next, false));
         };
         match item {
             None => break,
@@ -195,6 +237,7 @@ pub(crate) async fn run<E: Item>(
     start: Option<u64>,
     mask: Option<Arc<FieldMaskTree>>,
     out: mpsc::Sender<Result<E, Error>>,
+    deadlines: Deadlines,
 ) {
     // Next checkpoint owed to the caller.
     let mut next = start;
@@ -202,7 +245,17 @@ pub(crate) async fn run<E: Item>(
     let mut failures = 0u32;
     'connect: loop {
         let mut delay = None;
-        match source.connect(next).await {
+        let connected = tokio::select! {
+            r = tokio::time::timeout(deadlines.connect, source.connect(next)) => r,
+            _ = out.closed() => return,
+        };
+        let connected = connected.unwrap_or_else(|_| {
+            Err(ConnError::Retry(
+                format!("no response in {:?}", deadlines.connect),
+                None,
+            ))
+        });
+        match connected {
             Err(ConnError::Fatal(e)) => {
                 let _ = out.send(Err(e)).await;
                 return;
@@ -224,7 +277,7 @@ pub(crate) async fn run<E: Item>(
                         failures = 0;
                         continue;
                     }
-                    Some(h) => match backfill(h.as_ref(), n, oldest, &out).await {
+                    Some(h) => match backfill(h.as_ref(), n, oldest, &out, deadlines).await {
                         None => return,
                         Some((reached, done)) => {
                             if reached > n {
@@ -246,11 +299,23 @@ pub(crate) async fn run<E: Item>(
             Err(ConnError::Renew) => continue,
             Ok(mut events) => {
                 tracing::debug!(?next, "connected");
+                // The progress watchdog: reset by each checkpoint or gap
+                // received (duplicates included: the server is moving), not
+                // by keepalives, and not while the consumer is slow to take
+                // what was delivered.
+                let mut progress_by = tokio::time::Instant::now() + deadlines.progress;
                 loop {
                     let item = tokio::select! {
                         item = events.next() => item,
+                        _ = tokio::time::sleep_until(progress_by) => {
+                            tracing::warn!(?next, after = ?deadlines.progress, "no checkpoints on this connection; reconnecting");
+                            break;
+                        }
                         _ = out.closed() => return,
                     };
+                    if matches!(item, Some(Ok(_))) {
+                        progress_by = tokio::time::Instant::now() + deadlines.progress;
+                    }
                     let event = match item {
                         None => {
                             tracing::debug!(?next, "stream closed by server");
@@ -306,6 +371,8 @@ pub(crate) async fn run<E: Item>(
                     if out.send(Ok(event)).await.is_err() {
                         return;
                     }
+                    // Time spent waiting on the consumer isn't the server's.
+                    progress_by = tokio::time::Instant::now() + deadlines.progress;
                 }
             }
         }
@@ -486,7 +553,14 @@ mod tests {
             resumes: Mutex::new(vec![]),
         });
         let (tx, mut rx) = mpsc::channel(8);
-        let task = tokio::spawn(run::<E>(source.clone(), history, start, None, tx));
+        let task = tokio::spawn(run::<E>(
+            source.clone(),
+            history,
+            start,
+            None,
+            tx,
+            Deadlines::default(),
+        ));
         let mut got = vec![];
         while got.len() < n {
             got.push(match rx.recv().await.unwrap() {
@@ -746,6 +820,7 @@ mod tests {
             Some(1),
             None,
             tx,
+            Deadlines::default(),
         ));
         for want in ["1", "2", "3"] {
             assert_eq!(rx.recv().await.unwrap().unwrap().show(), want);
@@ -854,5 +929,183 @@ mod tests {
         .await;
         assert_eq!(got, ["10", "11 b\"\\n\\x05\\x01\"", "12", "13"]);
         assert_eq!(resumes, [Some(10), Some(13)]);
+    }
+
+    // Nothing waits without a deadline (2026-11-08: after a hub restart,
+    // resuming clients waited on the archive forever, alive but frozen).
+
+    /// History whose tip never answers, and whose first `checkpoints` call
+    /// hangs after `hang_after` items (`None`: never hangs).
+    struct HangingHistory {
+        hang_after: Mutex<Option<usize>>,
+    }
+
+    impl History for HangingHistory {
+        fn tip(&self) -> futures::future::BoxFuture<'static, Option<u64>> {
+            Box::pin(futures::future::pending())
+        }
+
+        fn checkpoints(
+            &self,
+            range: std::ops::Range<u64>,
+        ) -> futures::stream::BoxStream<'static, Result<HistoryItem, String>> {
+            let items =
+                range.map(|seq| Ok(HistoryItem::Checkpoint(seq, Box::new(checkpoint(seq)))));
+            match self.hang_after.lock().unwrap().take() {
+                Some(n) => futures::stream::iter(items.take(n).collect::<Vec<_>>())
+                    .chain(futures::stream::pending())
+                    .boxed(),
+                None => futures::stream::iter(items.collect::<Vec<_>>()).boxed(),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_archive_tip_that_never_answers_does_not_freeze() {
+        let history: Arc<dyn History> = Arc::new(HangingHistory {
+            hang_after: Mutex::new(None),
+        });
+        let started = tokio::time::Instant::now();
+        let (got, resumes) = play_with::<Event>(
+            Some(history),
+            Some(1),
+            vec![Err(too_old(4)), Ok(vec![cp(4), cp(5)])],
+            5,
+        )
+        .await;
+        assert_eq!(got, ["1", "2", "3", "4", "5"]);
+        assert_eq!(resumes, [Some(1), Some(4)]);
+        // Paused time jumps to any timer, however far: bound it explicitly.
+        assert!(
+            started.elapsed() <= Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_archive_that_stalls_mid_backfill_is_retried() {
+        let history: Arc<dyn History> = Arc::new(HangingHistory {
+            hang_after: Mutex::new(Some(1)),
+        });
+        let started = tokio::time::Instant::now();
+        let (got, resumes) = play_with::<Event>(
+            Some(history),
+            Some(1),
+            vec![Err(too_old(4)), Err(too_old(4)), Ok(vec![cp(4)])],
+            4,
+        )
+        .await;
+        assert_eq!(got, ["1", "2", "3", "4"]);
+        assert_eq!(resumes, [Some(1), Some(2), Some(4)]);
+        assert!(
+            started.elapsed() <= Duration::from_secs(5 * 60),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_with_only_keepalives_is_dropped_and_resumed() {
+        // The first connection delivers 1, then stays open with nothing
+        // (keepalives never reach the driver): the watchdog resumes from 2.
+        let source = Arc::new(Scripted {
+            conns: Mutex::new(vec![Ok(vec![cp(1)])].into()),
+            resumes: Mutex::new(vec![]),
+        });
+        struct Then(Arc<Scripted>, Mutex<VecDeque<Script>>);
+        impl Source for Then {
+            fn connect(
+                &self,
+                next: Option<u64>,
+            ) -> BoxFuture<'static, Result<EventStream, ConnError>> {
+                self.0.resumes.lock().unwrap().push(next);
+                let first = self.0.conns.lock().unwrap().pop_front();
+                let later = if first.is_none() {
+                    self.1.lock().unwrap().pop_front()
+                } else {
+                    None
+                };
+                Box::pin(async move {
+                    match (first, later) {
+                        // Delivers its events, then hangs (open, silent).
+                        (Some(Ok(events)), _) => Ok(futures::stream::iter(events)
+                            .chain(futures::stream::pending())
+                            .boxed()),
+                        (_, Some(Ok(events))) => Ok(futures::stream::iter(events).boxed()),
+                        _ => Ok(futures::stream::pending().boxed()),
+                    }
+                })
+            }
+        }
+        let then = Arc::new(Then(
+            source.clone(),
+            Mutex::new(vec![Ok(vec![cp(2), cp(3)])].into()),
+        ));
+        let (tx, mut rx) = mpsc::channel(8);
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(run::<Event>(
+            then,
+            None,
+            Some(1),
+            None,
+            tx,
+            Deadlines::default(),
+        ));
+        let mut got = vec![];
+        while got.len() < 3 {
+            got.push(rx.recv().await.unwrap().unwrap().show());
+        }
+        task.abort();
+        assert_eq!(got, ["1", "2", "3"]);
+        assert_eq!(&source.resumes.lock().unwrap()[..2], [Some(1), Some(2)]);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(60) && waited < Duration::from_secs(120),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_answers_is_retried() {
+        struct HangOnce(Mutex<bool>, Mutex<Vec<Option<u64>>>);
+        impl Source for HangOnce {
+            fn connect(
+                &self,
+                next: Option<u64>,
+            ) -> BoxFuture<'static, Result<EventStream, ConnError>> {
+                self.1.lock().unwrap().push(next);
+                let hang = std::mem::replace(&mut *self.0.lock().unwrap(), false);
+                Box::pin(async move {
+                    if hang {
+                        futures::future::pending::<()>().await;
+                    }
+                    Ok(futures::stream::iter(vec![cp(7), cp(8)]).boxed())
+                })
+            }
+        }
+        let source = Arc::new(HangOnce(Mutex::new(true), Mutex::new(vec![])));
+        let started = tokio::time::Instant::now();
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(run::<Event>(
+            source.clone(),
+            None,
+            Some(7),
+            None,
+            tx,
+            Deadlines::default(),
+        ));
+        let mut got = vec![];
+        while got.len() < 2 {
+            got.push(rx.recv().await.unwrap().unwrap().show());
+        }
+        task.abort();
+        assert_eq!(got, ["7", "8"]);
+        assert_eq!(&source.1.lock().unwrap()[..2], [Some(7), Some(7)]);
+        assert!(
+            started.elapsed() <= Duration::from_secs(3 * 60),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

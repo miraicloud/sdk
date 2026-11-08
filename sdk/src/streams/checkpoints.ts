@@ -93,6 +93,13 @@ export interface CheckpointStreamOptions {
   /** Reconnect when no bytes arrive for this long (keepalives come every 15 s). Default 45 000. */
   readonly stallTimeoutMs?: number | undefined;
   /**
+   * Reconnect (resuming from the cursor) when a connection delivers no
+   * checkpoint or gap for this long, even if keepalives still arrive: a
+   * server that stays connected but stops sending checkpoints can't freeze
+   * the subscription. Default 60 000 (Mainnet makes ~4 checkpoints a second).
+   */
+  readonly progressTimeoutMs?: number | undefined;
+  /**
    * Decompresses a body the HTTP client left zstd-compressed. Default:
    * `node:zlib` (Node ≥ 22.15, Bun); pass one (e.g. a WASM zstd as a
    * `TransformStream`) on runtimes without it.
@@ -315,6 +322,8 @@ export interface SourceOptions {
   readonly zstdDecoder: ZstdDecoder | undefined;
   /** No bytes (keepalives included) for this long → reconnect. */
   readonly stallTimeoutMs: number;
+  /** No checkpoint or gap (keepalives don't count) for this long → reconnect. */
+  readonly progressTimeoutMs: number;
 }
 
 /**
@@ -446,6 +455,12 @@ export const httpSource = <C extends CheckpointLike, G extends GapLike>(options:
             Stream.timeoutOrElse({ duration: stall, orElse: () => Stream.fail(noData()) }),
             Stream.mapEffect((chunk) => Effect.try({ try: () => items(chunk), catch: failed("malformed frame") })),
             Stream.flattenIterable,
+            // The progress watchdog: as the stall timer, it runs only while
+            // the consumer is pulling.
+            Stream.timeoutOrElse({
+              duration: options.progressTimeoutMs,
+              orElse: () => Stream.fail(new Retry({ message: `no checkpoints for ${options.progressTimeoutMs} ms` })),
+            }),
           );
           // A delegated key: reconnect once a fresh one exists (resuming after the cursor: nothing lost).
           if (renew === undefined) return read;
@@ -463,11 +478,13 @@ const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.me
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 const DEFAULT_STALL_MS = 45_000;
+const DEFAULT_PROGRESS_MS = 60_000;
 
 /** Options, validated. */
 interface Resolved {
   readonly start: bigint | undefined;
   readonly stallTimeoutMs: number;
+  readonly progressTimeoutMs: number;
   readonly readMask: readonly string[] | undefined;
 }
 
@@ -483,8 +500,10 @@ export const resolve = (o: CheckpointStreamOptions): Result.Result<Resolved, Inv
     const start = o.from !== undefined ? yield* toBigInt(o.from, "from") : o.after !== undefined ? (yield* toBigInt(o.after, "after")) + 1n : undefined;
     const stallTimeoutMs = o.stallTimeoutMs ?? DEFAULT_STALL_MS;
     if (!(stallTimeoutMs > 0)) return yield* Result.fail(new Invalid({ message: "`stallTimeoutMs` must be positive" }));
+    const progressTimeoutMs = o.progressTimeoutMs ?? DEFAULT_PROGRESS_MS;
+    if (!(progressTimeoutMs > 0)) return yield* Result.fail(new Invalid({ message: "`progressTimeoutMs` must be positive" }));
     const readMask = yield* resolveMask(o.readMask);
-    return { start, stallTimeoutMs, readMask };
+    return { start, stallTimeoutMs, progressTimeoutMs, readMask };
   });
 
 export interface Connection {
@@ -511,7 +530,7 @@ export const subscribe = <C extends CheckpointLike, G extends GapLike>(
     const archive = options.archive ?? {};
     const history = archive === false ? undefined : archiveHistory({ client: archive.client, host: archive.host, concurrency: archive.concurrency, readMask: r.readMask });
     const live = httpSource(
-      { ...connection, zstdDecoder: options.zstdDecoder ?? nativeZstdDecoder(), stallTimeoutMs: r.stallTimeoutMs },
+      { ...connection, zstdDecoder: options.zstdDecoder ?? nativeZstdDecoder(), stallTimeoutMs: r.stallTimeoutMs, progressTimeoutMs: r.progressTimeoutMs },
       r.readMask ? masked(decode, r.readMask) : decode,
     );
     return drive({

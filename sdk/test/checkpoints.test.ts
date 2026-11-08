@@ -702,7 +702,7 @@ describe("the checkpoint stream against a local server (Bun.serve)", () => {
 
       test("invalid options fail with Invalid, before any request", async () => {
         reset(() => body([cpFrame(1)]));
-        for (const options of [{ from: 1, after: 2 }, { stallTimeoutMs: 0 }, { from: -1 }, { from: 1.5 }, { readMask: ["nope"] }, { readMask: ["objects.objects.json"] }]) {
+        for (const options of [{ from: 1, after: 2 }, { stallTimeoutMs: 0 }, { progressTimeoutMs: 0 }, { from: -1 }, { from: 1.5 }, { readMask: ["nope"] }, { readMask: ["objects.objects.json"] }]) {
           expect(await failure(mode, options)).toBeInstanceOf(Invalid);
         }
         expect(requests.length).toBe(0);
@@ -757,6 +757,31 @@ describe("the checkpoint stream against a local server (Bun.serve)", () => {
         const t0 = Date.now();
         expect(await collect(mode, 2, { stallTimeoutMs: 300 })).toEqual([1, 2]);
         expect(Date.now() - t0).toBeGreaterThanOrEqual(780); // stall + the first backoff (1 s, jittered down to half)
+        expect(from(1)).toBe("2");
+      });
+
+      test("progress: keepalives but no checkpoints → reconnect from the cursor", async () => {
+        // The first connection delivers 1, then only keepalives (it never
+        // stalls): the progress watchdog resumes from 2 (2026-11-08).
+        let timer: ReturnType<typeof setInterval> | undefined;
+        const alive = (frames: Uint8Array[]) =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(c) {
+                for (const f of [keepalive(), ...frames]) c.enqueue(zstd(f));
+                timer = setInterval(() => c.enqueue(zstd(keepalive())), 50);
+              },
+              cancel() {
+                clearInterval(timer);
+              },
+            }),
+            { headers: { "content-type": "application/vnd.miraicloud.checkpoints.v1+proto", "content-encoding": "zstd" } },
+          );
+        reset((_, n) => (n === 1 ? alive([cpFrame(1)]) : body([cpFrame(2)], true)));
+        const t0 = Date.now();
+        expect(await collect(mode, 2, { stallTimeoutMs: 300, progressTimeoutMs: 500 })).toEqual([1, 2]);
+        clearInterval(timer);
+        expect(Date.now() - t0).toBeGreaterThanOrEqual(500);
         expect(from(1)).toBe("2");
       });
 
@@ -856,6 +881,7 @@ describe("http source", () => {
     auth: Auth.None(),
     zstdDecoder: undefined,
     stallTimeoutMs: 1000,
+    progressTimeoutMs: 60_000,
     ...extra,
   });
   const drain = (src: ReturnType<typeof httpSource<AnyCheckpoint, AnyGap>>, after?: bigint) => Effect.runPromiseExit(Stream.runCollect(src.connect(after)));
