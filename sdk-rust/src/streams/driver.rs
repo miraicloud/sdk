@@ -580,6 +580,7 @@ mod tests {
                     Err(ConnError::Fatal(Error::Http {
                         status: 400,
                         body: "bad mask".into(),
+                        tag: None,
                     })),
                 ]
             },

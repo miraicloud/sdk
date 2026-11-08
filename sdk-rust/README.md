@@ -8,11 +8,13 @@ The [mirai.cloud](https://mirai.cloud) SDK for Rust. The TypeScript SDK is [`@mi
 
 You need an API key with the `stream:read` scope (`miraicloud keys create --name indexer --scope stream:read`), or a delegation chain that grants it (see [Delegation](#delegation)).
 
-Not on crates.io yet; depend on the repository:
+Not on crates.io yet; depend on a release tag of the repository (Rust 1.90 or newer):
 
 ```toml
-miraicloud = { git = "https://github.com/miraicloud/sdk" }
+miraicloud = { git = "https://github.com/miraicloud/sdk", tag = "rust-v0.1.0" }
 ```
+
+Checkpoints are `sui-rpc` 0.4's types (`miraicloud::streams::Checkpoint`); if you also depend on `sui-rpc`, use the same version.
 
 ## The checkpoint stream
 
@@ -32,6 +34,7 @@ while let Some(event) = sub.next().await {
             println!("{seq} {:?}", checkpoint.digest);
         }
         Event::Gap { from, to } => eprintln!("missed {from}..={to}"),
+        _ => {}                                       // kinds added in later releases
     }
     save(sub.cursor());                               // and/or sub.last_delivered()
 }
@@ -42,13 +45,14 @@ while let Some(event) = sub.next().await {
 Other builder options: `url` (default `DEFAULT_STREAM_URL`), `auth` / `delegation` (see [Delegation](#delegation)), `header`, `archive(url)` (default `DEFAULT_ARCHIVE_URL`), `no_archive()`, `archive_concurrency`, `stall_timeout`. `subscribe()` needs a Tokio runtime; dropping the `Subscription` closes the connection. Checkpoint types come from crates.io `sui-rpc`.
 
 - **Order.** Checkpoints come strictly in sequence order, without duplicates. Anything that would skip a checkpoint without a gap is treated as a broken connection and reconnected.
-- **History.** The stream holds only the most recent checkpoints. A start (or resume) further back is read from the archive (`archive.mainnet.sui.io`, every checkpoint since genesis) with `ListCheckpoints`, 50 checkpoints a page, `archive_concurrency` pages in flight (default 4), up to the archive's own tip; then the stream takes over, without a hole or a duplicate. Archive checkpoints come out exactly as the stream sends them (object types in effects filled, the mask applied the same way). With `no_archive()`, that range is a gap instead.
+- **History.** The stream holds only the most recent checkpoints. A start (or resume) further back is read from the archive (`archive.mainnet.sui.io`, every checkpoint since genesis) with `ListCheckpoints`, 50 checkpoints a page, `archive_concurrency` pages in flight (default 2), up to the archive's own tip; then the stream takes over, without a hole or a duplicate. Archive checkpoints come out exactly as the stream sends them (object types in effects filled, the mask applied the same way). With `no_archive()`, that range is a gap instead. Each page in flight is held in memory: with the whole checkpoint (no read mask) ~250 MB a page at today's Mainnet sizes, so a deep backfill peaks at ~600 MB (`archive_concurrency(1)`: ~370 MB, slower); with a read mask naming the fields you need, a few MB.
 - **Masks.** The stream sends every client the whole checkpoint, BCS encodings included (`BCS_PATHS`). The SDK applies the read mask (`sui.rpc.v2.Checkpoint` field paths) locally, to live and archive checkpoints alike. With no mask (or `*`) you get everything; a parent path such as `summary` keeps the whole field, its `bcs` included. Invalid paths, and fields no node renders consistently (event and object JSON, object display), are rejected by `build()`.
 - **Gaps.** Checkpoints that can't be delivered are yielded once as `Event::Gap`; the stream then continues at `to + 1`.
 - **Position.** `last_delivered()`: the last checkpoint yielded. `cursor()`: everything up to it has been yielded, as a checkpoint or inside a gap; persist it and pass it to `resume_after`.
 - **Reconnects.** Backoff 1 s doubling to 30 s, jittered (reset on progress), at least `Retry-After`. No bytes for 45 s (keepalives come every 15 s) means a dead connection (`stall_timeout`). A slow consumer pauses reading (bounded buffers) and is never mistaken for a stall. Archive failures are retried the same way, from where the backfill stopped.
-- **Errors.** A subscription ends, with `Error::Http` as its last item, only when it's refused for good: HTTP 400, 401, 403, 404 (until the stream has once answered; later a 404 is retried), or 429 over quota (`QuotaExceeded`); with delegated auth, also with `Error::Auth` when the token exchange refuses the chain (revoked, expired, invalid). Network errors, 5xx, other 429s, stalls, malformed frames and archive outages are retried and logged with `tracing`.
-- **Compression.** The stream is zstd (concatenated zstd frames); reqwest decodes it.
+- **Errors.** A subscription ends, with `Error::Http { status, body, tag }` as its last item (`tag`: the API error's `_tag`, e.g. `Unauthorized`, `QuotaExceeded`), only when it's refused for good: HTTP 400, 401, 403, 404 (before the stream has once answered, after 6 attempts over 15–30 s; later a 404 is retried), or 429 over quota (`QuotaExceeded`); with delegated auth, also with `Error::Auth` when the token exchange refuses the chain (revoked, expired, invalid). Network errors, 5xx, other 429s, stalls, malformed frames and archive outages are retried and logged with `tracing`.
+- **Compression.** The stream is zstd (concatenated zstd frames); reqwest decodes it, over rustls.
+- **Compatibility.** `Error`, `Event` and `RawEvent` are `#[non_exhaustive]`: match them with a wildcard arm, so later releases can add kinds without breaking your build. A builder's `Debug` shows header names, never their values.
 
 ## Delegation
 

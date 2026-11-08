@@ -17,7 +17,7 @@ const CHECKPOINT: u8 = 0;
 const GAP: u8 = 1;
 /// A frame larger than this is treated as a corrupt stream (the largest
 /// Mainnet checkpoints are ~20 MB).
-const MAX_FRAME: usize = 256 * 1024 * 1024;
+const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// A parsed frame. Checkpoint bodies share the parser's buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]

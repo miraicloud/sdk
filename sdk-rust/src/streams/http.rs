@@ -42,6 +42,10 @@ pub(crate) enum ConnError {
     Renew,
 }
 
+/// Attempts a `404` gets before the stream has once answered (with the
+/// reconnect backoff between them: 15–30 s in all).
+pub(crate) const NOT_FOUND_ATTEMPTS: u32 = 6;
+
 pub(crate) type EventStream = BoxStream<'static, Result<StreamEvent, ConnError>>;
 
 /// Opens connections. Abstracted for tests.
@@ -60,6 +64,10 @@ pub(crate) struct HttpSource {
     /// service's transient state (a deploy, a route moving), not a wrong
     /// URL, so it is retried rather than final.
     served: Arc<AtomicBool>,
+    /// `404`s before the stream has once answered: retried
+    /// [`NOT_FOUND_ATTEMPTS`] times in all (a process started during a
+    /// deploy waits it out), then final (a wrong URL).
+    not_found: Arc<AtomicU32>,
     /// Computes `authorization` per connection (overrides `headers`).
     auth: Option<Auth>,
     /// Consecutive `401`s with an exchanged token: the first one renews the
@@ -90,7 +98,10 @@ impl HttpSource {
         // reqwest (zstd feature only) sends `Accept-Encoding: zstd`, the
         // stream's encoding, and decodes the concatenated zstd frames
         // transparently.
+        // rustls always, even when another crate in the build enables
+        // reqwest's native TLS.
         let client = reqwest::Client::builder()
+            .use_rustls_tls()
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| Error::Config(format!("http client: {e}")))?;
@@ -104,6 +115,7 @@ impl HttpSource {
             headers: map,
             stall_timeout,
             served: Arc::new(AtomicBool::new(false)),
+            not_found: Arc::new(AtomicU32::new(0)),
             auth,
             refused: Arc::new(AtomicU32::new(0)),
         })
@@ -128,6 +140,7 @@ impl Source for HttpSource {
         }
         let stall = self.stall_timeout;
         let served = self.served.clone();
+        let not_found = self.not_found.clone();
         let auth = self.auth.clone();
         let refused = self.refused.clone();
         Box::pin(async move {
@@ -194,11 +207,14 @@ impl Source for HttpSource {
                     status,
                     StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
                 ) || (status == StatusCode::NOT_FOUND
-                    && !served.load(Ordering::Relaxed))
-                    || (status == StatusCode::TOO_MANY_REQUESTS && is_quota_exceeded(&body));
+                    && !served.load(Ordering::Relaxed)
+                    && not_found.fetch_add(1, Ordering::Relaxed) + 1 >= NOT_FOUND_ATTEMPTS)
+                    || (status == StatusCode::TOO_MANY_REQUESTS
+                        && error_tag(&body).as_deref() == Some("QuotaExceeded"));
                 return Err(if fatal {
                     ConnError::Fatal(Error::Http {
                         status: status.as_u16(),
+                        tag: error_tag(&body),
                         body,
                     })
                 } else {
@@ -224,16 +240,11 @@ impl Source for HttpSource {
     }
 }
 
-/// Whether a refusal's body is the gateway's `QuotaExceeded` error.
-fn is_quota_exceeded(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("_tag")
-                .and_then(|t| t.as_str())
-                .map(|t| t == "QuotaExceeded")
-        })
-        .unwrap_or(false)
+/// A refusal's `_tag` when its body is the API's JSON error
+/// (`{"_tag": "QuotaExceeded", …}`).
+pub(crate) fn error_tag(body: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    Some(v.get("_tag")?.as_str()?.to_owned())
 }
 
 /// `events` until `renew` resolves (it renews the token meanwhile), then

@@ -46,6 +46,7 @@ async fn take(builder: miraicloud::streams::Builder, n: usize) -> Vec<Event> {
                 }
                 next = Some(to + 1);
             }
+            other => panic!("unexpected {other:?}"),
         }
         out.push(ev);
     }
@@ -57,6 +58,7 @@ fn first_seq(events: &[Event]) -> u64 {
     match &events[0] {
         Event::Checkpoint { seq, .. } => *seq,
         Event::Gap { from, .. } => *from,
+        other => panic!("unexpected {other:?}"),
     }
 }
 
@@ -135,5 +137,6 @@ fn typed_cursor(events: &[Event]) -> Option<u64> {
     events.last().map(|e| match e {
         Event::Checkpoint { seq, .. } => *seq,
         Event::Gap { to, .. } => *to,
+        other => panic!("unexpected {other:?}"),
     })
 }

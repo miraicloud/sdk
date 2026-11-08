@@ -617,6 +617,7 @@ async fn a_stream_renews_its_token_without_gaps_or_duplicates() {
                 seqs.push(seq);
             }
             Event::Gap { from, to } => panic!("gap {from}-{to}"),
+            other => panic!("unexpected {other:?}"),
         }
     }
     drop(sub);
@@ -667,6 +668,7 @@ async fn a_stream_keeps_flowing_while_its_token_is_renewed() {
         match ev.unwrap() {
             Event::Checkpoint { seq, .. } => seqs.push(seq),
             Event::Gap { from, to } => panic!("gap {from}-{to}"),
+            other => panic!("unexpected {other:?}"),
         }
         let now = tokio::time::Instant::now();
         if let Some(last) = last {

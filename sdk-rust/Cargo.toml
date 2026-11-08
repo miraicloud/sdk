@@ -3,6 +3,8 @@ name = "miraicloud"
 version = "0.1.0"
 description = "The mirai.cloud SDK for Rust: Streams (the Sui checkpoint stream: ordered, resumable from any checkpoint, history from the Sui archive) and Sui-native delegation"
 edition = "2024"
+# Let chains need 1.88; dependencies (roaring, via sui-sdk-types) need 1.90.
+rust-version = "1.90"
 license = "Apache-2.0"
 homepage = "https://mirai.cloud"
 documentation = "https://docs.mirai.cloud"

@@ -345,9 +345,10 @@ export interface ArchiveOptions {
   /** The caller's read mask (undefined: full checkpoint). */
   readonly readMask: readonly string[] | undefined;
   /**
-   * Pages (`PAGE` checkpoints each) in flight. Default 4: more doesn't read
-   * faster (full checkpoints are bandwidth- and decode-bound, ~100/s), and
-   * each page in flight holds its checkpoints in memory.
+   * Pages (`PAGE` checkpoints each) in flight. Default 2: each page in
+   * flight holds its checkpoints in memory (with the whole checkpoint, a few
+   * hundred MB a page), and more read faster only up to the link's
+   * bandwidth and the decoding.
    */
   readonly concurrency?: number;
 }
@@ -367,7 +368,7 @@ export const archiveHistory = (options: ArchiveOptions): HistorySource => {
   const kept = tree(p.prune);
   // Pages are placed by sequence number: always ask for it (pruned again if unwanted).
   const paths = p.request.some((r) => covers(r, "sequence_number")) ? [...p.request] : [...p.request, "sequence_number"];
-  const concurrency = Math.max(1, options.concurrency ?? 4);
+  const concurrency = Math.max(1, options.concurrency ?? 2);
   let client: Promise<{ client: SuiGrpcClient; close?: () => void }> | undefined = options.client
     ? Promise.resolve({ client: options.client })
     : undefined;

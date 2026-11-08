@@ -12,12 +12,12 @@ import { GrpcTypes } from "@mysten/sui/grpc";
 import { Effect, Exit, Layer, Option, Redacted, Result, Stream } from "effect";
 import { HttpClient, HttpClientResponse } from "effect/http";
 import { Auth } from "../src/auth.js";
-import { Invalid, QuotaExceeded, Unauthorized } from "@miraicloud/core/errors";
+import { Invalid, NotFound, QuotaExceeded, Unauthorized } from "@miraicloud/core/errors";
 import { HEADERS } from "@miraicloud/core/signed";
 import { fromSuiSigner } from "@miraicloud/core/signer";
 import { type CheckpointItem, type CheckpointStreamOptions, Diagnostic, layerFetch, MiraiCloudStream, type RawCheckpointItem } from "../src/streams.js";
 import { ArchiveError, archiveHistory, BCS_PATHS, CANONICAL, DEFAULT, effective, fillObjectTypes, type HistoryItem, type HistorySource, plan, prune } from "../src/streams/archive.js";
-import { decoded, fetchDecodesZstd, httpSource, keepFields, masked, nativeZstdDecoder, raw, type SourceOptions } from "../src/streams/checkpoints.js";
+import { decoded, fetchDecodesZstd, httpSource, keepFields, masked, NOT_FOUND_ATTEMPTS, nativeZstdDecoder, raw, type SourceOptions } from "../src/streams/checkpoints.js";
 import { type Decoder, drive, type LiveSource, Retry, TooOld } from "../src/streams/driver.js";
 import { FrameParser, splitResponse } from "../src/streams/frame.js";
 import { EXCLUDED_PATHS, resolveMask } from "../src/streams/mask.js";
@@ -899,6 +899,16 @@ describe("http source", () => {
     const error = Exit.isFailure(cold) ? Option.getOrUndefined(Exit.findErrorOption(cold)) : undefined;
     expect(error).toBeInstanceOf(Retry);
     expect((error as Retry).retryAfterMs).toBe(2000);
+  });
+
+  test("a 404 before the stream has once answered is retried NOT_FOUND_ATTEMPTS times in all, then final", async () => {
+    const src = httpSource(options(rawClient([], undefined, 404)), typed);
+    for (let attempt = 1; attempt <= NOT_FOUND_ATTEMPTS; attempt++) {
+      const exit = await Effect.runPromiseExit(Stream.runCollect(src.connect(undefined)));
+      const error = Exit.isFailure(exit) ? Option.getOrUndefined(Exit.findErrorOption(exit)) : undefined;
+      if (attempt < NOT_FOUND_ATTEMPTS) expect(error).toBeInstanceOf(Retry);
+      else expect(error).toBeInstanceOf(NotFound);
+    }
   });
 
   test("stall while waiting for headers → retried", async () => {

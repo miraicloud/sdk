@@ -341,14 +341,17 @@ impl Archive {
         })
     }
 
-    /// The checkpoints the archive has in `range`, ascending: one
-    /// `ListCheckpoints` call, continued from its cursor if the server stops
-    /// at an item limit of its own before the end.
+    /// The checkpoints the archive has in `range`, ascending, each filled
+    /// and masked as it arrives (a page holds only what the caller keeps):
+    /// one `ListCheckpoints` call, continued from its cursor if the server
+    /// stops at an item limit of its own before the end.
     async fn list(
         mut client: sui_rpc::Client,
         mask: FieldMask,
         range: Range<u64>,
-    ) -> Result<Vec<Checkpoint>, tonic::Status> {
+        fill: bool,
+        remask: &FieldMaskTree,
+    ) -> Result<Vec<(Option<u64>, Checkpoint)>, tonic::Status> {
         let mut out = Vec::new();
         let mut after = None;
         loop {
@@ -371,8 +374,12 @@ impl Archive {
                 .into_inner();
             let (mut reason, mut cursor) = (None, None);
             while let Some(frame) = frames.message().await? {
-                if let Some(cp) = frame.checkpoint {
-                    out.push(cp);
+                if let Some(mut cp) = frame.checkpoint {
+                    if fill {
+                        fill_object_types(&mut cp);
+                    }
+                    // Placed by its sequence number, which the mask may drop.
+                    out.push((cp.sequence_number, Checkpoint::merge_from(&cp, remask)));
                 }
                 if let Some(c) = frame.watermark.and_then(|w| w.cursor) {
                     cursor = Some(c);
@@ -381,7 +388,7 @@ impl Archive {
                     reason = end.reason;
                 }
             }
-            let last = out.last().and_then(|cp: &Checkpoint| cp.sequence_number);
+            let last = out.last().and_then(|(seq, _)| *seq);
             if reason != Some(ITEM_LIMIT)
                 || cursor.is_none()
                 || last.is_some_and(|l| l + 1 >= range.end)
@@ -399,11 +406,13 @@ impl Archive {
         client: sui_rpc::Client,
         mask: FieldMask,
         range: Range<u64>,
-    ) -> Result<Vec<Checkpoint>, String> {
+        fill: bool,
+        remask: &FieldMaskTree,
+    ) -> Result<Vec<(Option<u64>, Checkpoint)>, String> {
         let mut backoff = Duration::from_millis(250);
         let (mut errors, mut short) = (0u32, false);
         loop {
-            match Self::list(client.clone(), mask.clone(), range.clone()).await {
+            match Self::list(client.clone(), mask.clone(), range.clone(), fill, remask).await {
                 Ok(got) if got.len() as u64 == range.end - range.start || short => return Ok(got),
                 Ok(_) => short = true,
                 Err(s) => {
@@ -431,16 +440,12 @@ impl Archive {
         }
     }
 
-    /// `range` as items: each checkpoint (filled and masked) or `Missing`.
-    fn items(
-        range: Range<u64>,
-        got: Vec<Checkpoint>,
-        fill: bool,
-        remask: &FieldMaskTree,
-    ) -> Result<Vec<Item>, String> {
+    /// `range` as items: each checkpoint (already filled and masked) or
+    /// `Missing`.
+    fn items(range: Range<u64>, got: Vec<(Option<u64>, Checkpoint)>) -> Result<Vec<Item>, String> {
         let mut by_seq = HashMap::with_capacity(got.len());
-        for cp in got {
-            match cp.sequence_number {
+        for (seq, cp) in got {
+            match seq {
                 Some(seq) if range.contains(&seq) && !by_seq.contains_key(&seq) => {
                     by_seq.insert(seq, cp);
                 }
@@ -456,12 +461,7 @@ impl Archive {
         Ok(range
             .map(|seq| match by_seq.remove(&seq) {
                 None => Item::Missing(seq),
-                Some(mut cp) => {
-                    if fill {
-                        fill_object_types(&mut cp);
-                    }
-                    Item::Checkpoint(seq, Box::new(Checkpoint::merge_from(&cp, remask)))
-                }
+                Some(cp) => Item::Checkpoint(seq, Box::new(cp)),
             })
             .collect())
     }
@@ -493,8 +493,8 @@ impl History for Archive {
             .map(move |page| {
                 let (client, mask, remask) = (client.clone(), mask.clone(), remask.clone());
                 async move {
-                    let got = Self::page(client, mask, page.clone()).await?;
-                    Self::items(page, got, fill, &remask)
+                    let got = Self::page(client, mask, page.clone(), fill, &remask).await?;
+                    Self::items(page, got)
                 }
             })
             // Pages in order, `concurrency` ahead; an error ends the stream.
@@ -631,13 +631,9 @@ mod tests {
 
     #[test]
     fn pages_become_items_in_order_with_missing() {
-        let cp = |seq| {
-            let mut c = Checkpoint::default();
-            c.sequence_number = Some(seq);
-            c
-        };
-        let all = FieldMaskTree::from_field_mask(&FieldMask::from_paths(["sequence_number"]));
-        let items = Archive::items(10..14, vec![cp(13), cp(10), cp(12)], false, &all).unwrap();
+        // Placed by the sequence number recorded before masking.
+        let cp = |seq| (Some(seq), Checkpoint::default());
+        let items = Archive::items(10..14, vec![cp(13), cp(10), cp(12)]).unwrap();
         let got: Vec<_> = items
             .iter()
             .map(|i| match i {
@@ -647,8 +643,9 @@ mod tests {
             .collect();
         assert_eq!(got, ["10", "missing 11", "12", "13"]);
         // Outside the page, or twice: the archive misbehaved.
-        assert!(Archive::items(10..14, vec![cp(14)], false, &all).is_err());
-        assert!(Archive::items(10..14, vec![cp(10), cp(10)], false, &all).is_err());
+        assert!(Archive::items(10..14, vec![cp(14)]).is_err());
+        assert!(Archive::items(10..14, vec![cp(10), cp(10)]).is_err());
+        assert!(Archive::items(10..14, vec![(None, Checkpoint::default())]).is_err());
     }
 
     /// Opt-in: archive backfill under a mask equals the gateway's render of

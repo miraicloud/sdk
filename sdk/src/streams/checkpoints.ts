@@ -63,7 +63,12 @@ export interface ArchiveConfig {
   readonly client?: SuiGrpcClient | undefined;
   /** `host:port` when no `client` is given. Default `MAINNET_ARCHIVE`. */
   readonly host?: string | undefined;
-  /** Pages (50 checkpoints each) in flight. Default 4: full checkpoints read at ~100/s, bound by bandwidth and decoding rather than requests. */
+  /**
+   * Pages (50 checkpoints each) in flight. Default 2. Each page in flight is
+   * held in memory, decoded: with the whole checkpoint (no read mask) a few
+   * hundred MB a page at today's Mainnet sizes; with a read mask naming the
+   * fields you need, a few MB.
+   */
   readonly concurrency?: number | undefined;
 }
 
@@ -313,12 +318,20 @@ export interface SourceOptions {
 }
 
 /**
- * A refused connection: final (`CheckpointStreamError`), too old (`TooOld`),
- * or worth another attempt (`Retry`). `served`: this subscription has been
- * served before, so a `404` is the service's transient state (a deploy, a
- * route moving), not a wrong URL: retried rather than final.
+ * Attempts a `404` gets before the stream has once answered (with the
+ * reconnect backoff between them: 15–30 s in all): a process started during
+ * a deploy waits it out; a wrong URL is final after them.
  */
-const refusal = (response: HttpClientResponse.HttpClientResponse, served: boolean): Effect.Effect<never, CheckpointStreamError | TooOld | Retry> =>
+export const NOT_FOUND_ATTEMPTS = 6;
+
+/**
+ * A refused connection: final (`CheckpointStreamError`), too old (`TooOld`),
+ * or worth another attempt (`Retry`). `retryNotFound`: a `404` is retried
+ * rather than final (the subscription has been served before, so it is the
+ * service's transient state, a deploy or a route moving; or it hasn't had
+ * `NOT_FOUND_ATTEMPTS` yet).
+ */
+const refusal = (response: HttpClientResponse.HttpClientResponse, retryNotFound: boolean): Effect.Effect<never, CheckpointStreamError | TooOld | Retry> =>
   Effect.gen(function* () {
     const text = (yield* response.text.pipe(Effect.orElseSucceed(() => ""))).slice(0, 500);
     // The gateway's refusals are JSON (`{ _tag, message }`); the stream's own are plain text.
@@ -339,7 +352,7 @@ const refusal = (response: HttpClientResponse.HttpClientResponse, served: boolea
       case 403:
         return yield* new Forbidden({ message });
       case 404:
-        if (served) return yield* new Retry({ message: `HTTP 404: ${message}`, retryAfterMs });
+        if (retryNotFound) return yield* new Retry({ message: `HTTP 404: ${message}`, retryAfterMs });
         return yield* new NotFound({ message });
       case 410: {
         // Older than the stream holds, which starts here.
@@ -358,6 +371,7 @@ const refusal = (response: HttpClientResponse.HttpClientResponse, served: boolea
 /** The checkpoint stream over HTTP; `decode` picks typed or raw checkpoints. */
 export const httpSource = <C extends CheckpointLike, G extends GapLike>(options: SourceOptions, decode: Decoder<C, G>): LiveSource<C, G, CheckpointStreamError> => {
   let served = false;
+  let notFound = 0;
   return {
     connect: (after) =>
       Stream.unwrap(
@@ -394,7 +408,7 @@ export const httpSource = <C extends CheckpointLike, G extends GapLike>(options:
             Effect.mapError(failed("connect failed")),
             Effect.timeoutOrElse({ duration: stall, orElse: () => Effect.fail(noData()) }),
           );
-          if (response.status !== 200) return yield* refusal(response, served);
+          if (response.status !== 200) return yield* refusal(response, served || (response.status === 404 && ++notFound < NOT_FOUND_ATTEMPTS));
           served = true;
           const reader = Stream.toReadableStream(response.stream).getReader();
           // The client may or may not have decoded the zstd body (Bun's fetch

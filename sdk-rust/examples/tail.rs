@@ -3,6 +3,7 @@
 //! ```sh
 //! MIRAICLOUD_API_KEY=mc1_… cargo run --release --example tail -- \
 //!     [--url URL] [--mask sequence_number,digest|full] [--start SEQ | --back N] [--secs S]
+//!     [--archive-concurrency N]
 //! ```
 //! `--back N` starts N checkpoints behind the stream's tip (older than the
 //! stream holds comes from the archive). Logs (`RUST_LOG=miraicloud=info`)
@@ -24,6 +25,7 @@ async fn main() -> Result<()> {
         .init();
     let mut args = std::env::args().skip(1);
     let (mut url, mut mask, mut start, mut back, mut secs) = (None, None, None, None, 300u64);
+    let mut archive_concurrency = None;
     while let Some(a) = args.next() {
         let mut v = || args.next().context("missing value");
         match a.as_str() {
@@ -32,6 +34,7 @@ async fn main() -> Result<()> {
             "--start" => start = Some(v()?.parse::<u64>()?),
             "--back" => back = Some(v()?.parse::<u64>()?),
             "--secs" => secs = v()?.parse()?,
+            "--archive-concurrency" => archive_concurrency = Some(v()?.parse::<usize>()?),
             other => bail!("unknown argument {other}"),
         }
     }
@@ -51,13 +54,16 @@ async fn main() -> Result<()> {
         let tip = loop {
             match probe.next().await.context("stream ended")?? {
                 Event::Checkpoint { seq, .. } => break seq,
-                Event::Gap { .. } => continue,
+                _ => continue,
             }
         };
         start = Some(tip - back);
         eprintln!("tip {tip}, starting at {}", tip - back);
     }
     let mut builder = base();
+    if let Some(n) = archive_concurrency {
+        builder = builder.archive_concurrency(n);
+    }
     let timestamps = match mask.filter(|m| m != "full") {
         Some(m) => {
             let has_ts = m
@@ -94,6 +100,8 @@ async fn main() -> Result<()> {
                         prev = Some(to);
                         continue;
                     }
+                    // Kinds added in later releases.
+                    _ => continue,
                 };
                 if let Some(p) = prev {
                     if seq <= p { dupes += 1; eprintln!("DUP/REORDER {seq} after {p}"); }

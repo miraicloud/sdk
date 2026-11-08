@@ -37,6 +37,7 @@
 //!             println!("{seq} {:?}", checkpoint.digest);
 //!         }
 //!         Event::Gap { from, to } => eprintln!("lost {from}..={to}"),
+//!         _ => {} // kinds added in later releases
 //!     }
 //!     // persist sub.cursor() to resume later with resume_after()
 //! }
@@ -70,22 +71,38 @@ pub use archive::DEFAULT_ARCHIVE_URL;
 /// ends after it. Transient failures (network, 5xx, 429, stalls, malformed
 /// frames, archive outages) are retried internally and logged with
 /// `tracing`.
+///
+/// New variants and fields may be added in minor releases: match with a
+/// wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("invalid configuration: {0}")]
     Config(String),
     /// The stream refused the request for good: 400, 401, 403, 404 (until
-    /// the stream has once answered), or 429 over quota (`QuotaExceeded`).
+    /// the stream has once answered, after a few attempts), or 429 over
+    /// quota (`QuotaExceeded`).
     #[error("stream rejected the request: HTTP {status}: {body}")]
-    Http { status: u16, body: String },
+    #[non_exhaustive]
+    Http {
+        status: u16,
+        /// The response body.
+        body: String,
+        /// The error's `_tag` when the body is the API's JSON error
+        /// (`{"_tag": "QuotaExceeded", "message": …}`): `Unauthorized`,
+        /// `Forbidden`, `Invalid`, `NotFound`, `QuotaExceeded`, …
+        tag: Option<String>,
+    },
     /// No token: the exchange refused the delegation chain (revoked,
     /// expired, invalid) or the signer failed.
     #[error("authentication failed: {0}")]
     Auth(#[from] crate::auth::Error),
 }
 
-/// One item of a [`Subscription`].
+/// One item of a [`Subscription`]. New kinds may be added in minor
+/// releases: match with a wildcard arm.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Event {
     /// The next checkpoint. `seq` is set even if the read mask omits
     /// `sequence_number`.
@@ -98,8 +115,10 @@ pub enum Event {
     Gap { from: u64, to: u64 },
 }
 
-/// One item of a [`RawSubscription`].
+/// One item of a [`RawSubscription`]. New kinds may be added in minor
+/// releases: match with a wildcard arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RawEvent {
     /// The next checkpoint. `data`: the encoded protobuf
     /// `sui.rpc.v2.Checkpoint`, not decoded (zero-copy from the stream
@@ -131,7 +150,7 @@ impl std::fmt::Debug for Client {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Builder {
     url: String,
     mask: Option<Vec<String>>,
@@ -143,6 +162,24 @@ pub struct Builder {
     stall_timeout: Duration,
 }
 
+/// Header names only: their values (an API key in `authorization`) never
+/// reach a log.
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<&str> = self.headers.iter().map(|(k, _)| k.as_str()).collect();
+        f.debug_struct("Builder")
+            .field("url", &self.url)
+            .field("mask", &self.mask)
+            .field("start", &self.start)
+            .field("headers", &headers)
+            .field("auth", &self.auth)
+            .field("archive_url", &self.archive_url)
+            .field("archive_concurrency", &self.archive_concurrency)
+            .field("stall_timeout", &self.stall_timeout)
+            .finish()
+    }
+}
+
 impl Client {
     pub fn builder() -> Builder {
         Builder {
@@ -152,7 +189,7 @@ impl Client {
             headers: Vec::new(),
             auth: None,
             archive_url: Some(DEFAULT_ARCHIVE_URL.to_owned()),
-            archive_concurrency: 4,
+            archive_concurrency: 2,
             stall_timeout: Duration::from_secs(45),
         }
     }
@@ -258,8 +295,12 @@ impl Builder {
     }
 
     /// Archive pages (`ListCheckpoints`, 50 checkpoints each) in flight
-    /// (default 4: full checkpoints read at ~100/s, bound by bandwidth and
-    /// decoding rather than requests; each page in flight is held in memory).
+    /// (default 2). Each page in flight is held in memory, decoded and
+    /// masked: with the whole checkpoint (no read mask) that is ~250 MB a
+    /// page at today's Mainnet sizes (a deep backfill peaks at ~600 MB with
+    /// 2, ~1.2 GB with 4, ~370 MB with 1, reading ~65, ~90 and ~40
+    /// checkpoints a second); with a read mask naming the fields you need,
+    /// a few MB.
     pub fn archive_concurrency(mut self, n: usize) -> Self {
         self.archive_concurrency = n;
         self

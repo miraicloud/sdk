@@ -219,6 +219,7 @@ impl Sub {
                     seq.to_string()
                 }
                 Ok(Event::Gap { from, to }) => format!("gap {from}-{to}"),
+                Ok(other) => panic!("unexpected {other:?}"),
                 Err(e) => show_err(e),
             },
             Sub::Raw(s) => match s.next().await? {
@@ -227,6 +228,7 @@ impl Sub {
                     seq.to_string()
                 }
                 Ok(RawEvent::Gap { from, to }) => format!("gap {from}-{to}"),
+                Ok(other) => panic!("unexpected {other:?}"),
                 Err(e) => show_err(e),
             },
         })
@@ -576,4 +578,74 @@ async fn serves_recorded_fixture() {
             }
         );
     }
+}
+
+/// A `404` before the stream has once answered (a process started during a
+/// deploy) is retried a few times before it is final.
+#[tokio::test]
+async fn not_found_before_the_first_answer_is_retried() {
+    let not_found = || {
+        Reply::Json(
+            StatusCode::NOT_FOUND,
+            r#"{"_tag":"NotFound","message":"no route"}"#,
+        )
+    };
+    let mock = Mock::default();
+    let url = mock
+        .serve(vec![not_found(), not_found(), frames(&[cp(5)], true)])
+        .await;
+    let mut sub = Sub::new(
+        miraicloud::streams::Client::builder().url(url).start_at(5),
+        false,
+    );
+    assert_eq!(take(&mut sub, 1).await, ["5"]);
+    assert_eq!(mock.requests.lock().unwrap().len(), 3);
+}
+
+/// ... and final after `NOT_FOUND_ATTEMPTS` (6) in all, with the error's tag.
+#[tokio::test]
+async fn not_found_is_final_after_six_attempts_with_its_tag() {
+    use miraicloud::streams::Error;
+    let not_found = || {
+        Reply::Json(
+            StatusCode::NOT_FOUND,
+            r#"{"_tag":"NotFound","message":"no route"}"#,
+        )
+    };
+    let mock = Mock::default();
+    let url = mock.serve((0..7).map(|_| not_found()).collect()).await;
+    let mut sub = miraicloud::streams::Client::builder()
+        .url(url)
+        .start_at(5)
+        .build()
+        .unwrap()
+        .subscribe();
+    let err = tokio::time::timeout(Duration::from_secs(60), sub.next())
+        .await
+        .expect("final within a minute")
+        .expect("an error")
+        .expect_err("refused");
+    match err {
+        Error::Http { status, tag, .. } => {
+            assert_eq!(status, 404);
+            assert_eq!(tag.as_deref(), Some("NotFound"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(sub.next().await.is_none(), "ends after a fatal error");
+    assert_eq!(mock.requests.lock().unwrap().len(), 6);
+}
+
+/// A builder's `Debug` names headers but never prints their values.
+#[test]
+fn builder_debug_hides_the_api_key() {
+    let b = miraicloud::streams::Client::builder()
+        .api_key("mc1_secret_key")
+        .header("x-other", "also-secret");
+    let shown = format!("{b:?}");
+    assert!(
+        shown.contains("authorization") && shown.contains("x-other"),
+        "{shown}"
+    );
+    assert!(!shown.contains("secret"), "{shown}");
 }

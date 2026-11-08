@@ -24,7 +24,7 @@ const HEADER_LEN = 5;
 const CHECKPOINT = 0;
 const GAP = 1;
 /** A frame larger than this is a corrupt stream (the largest Mainnet checkpoints are ~20 MB). */
-const MAX_FRAME = 256 * 1024 * 1024;
+const MAX_FRAME = 64 * 1024 * 1024;
 
 export type Frame = Data.TaggedEnum<{
   /** `cursor` (the sequence number) and the encoded `Checkpoint` (empty if the response had none). */
