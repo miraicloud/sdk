@@ -444,7 +444,9 @@ const FIRST_RESPONSE_MS = 30_000;
  * HTTP/2 keepalive's (10 s + 10 s).
  */
 const MESSAGE_DEADLINE_MS = 30_000;
-const MESSAGE_DEADLINE_MAX_MS = 480_000;
+// 60 s at most: an attempt waiting on a hung backend must not outlive it by
+// minutes (at 480 s, a 300 s archive stall left the client frozen 156 s after it cleared).
+const MESSAGE_DEADLINE_MAX_MS = 60_000;
 /** Asks of a short page before its absent checkpoints count as missing (~30 s): a gap is final for the caller. */
 const SHORT_ASKS = 5;
 
