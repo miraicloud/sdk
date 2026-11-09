@@ -5,7 +5,7 @@ Sign in with a Sui wallet, manage API keys and delegations, and stream Sui check
 | | |
 |---|---|
 | [`sdk/`](sdk) | **`@miraicloud/sdk`**, the TypeScript SDK (Node 22.15+, Bun). Not on npm yet: see [Installing the TypeScript SDK](#installing-the-typescript-sdk). |
-| [`sdk-rust/`](sdk-rust) | **`miraicloud`**, the Rust SDK. `miraicloud = { git = "https://github.com/miraicloud/sdk", tag = "rust-v0.1.2" }` |
+| [`sdk-rust/`](sdk-rust) | **`miraicloud`**, the Rust SDK. `miraicloud = { git = "https://github.com/miraicloud/sdk", tag = "rust-v0.1.3" }` |
 | [`core/`](core) | **`@miraicloud/core`**: signed requests, delegations, errors, models and the API contract. The TypeScript SDK re-exports it; you don't need to install it yourself. |
 
 Documentation: [docs.mirai.cloud](https://docs.mirai.cloud). The command-line tool is at [miraicloud/cli](https://github.com/miraicloud/cli).

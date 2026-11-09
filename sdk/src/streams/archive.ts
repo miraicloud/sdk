@@ -21,7 +21,7 @@
 import type { SuiGrpcClient } from "@mysten/sui/grpc";
 import { GrpcTypes } from "@mysten/sui/grpc";
 import type { IMessageType } from "@protobuf-ts/runtime";
-import { Data, Effect, Schedule, Stream } from "effect";
+import { Cause, Data, Effect, Queue, Schedule, Stream } from "effect";
 
 type Checkpoint = GrpcTypes.Checkpoint;
 
@@ -355,6 +355,8 @@ export interface HistorySource {
   readonly tip?: Effect.Effect<bigint, ArchiveError>;
   /** Release connections this source opened. */
   readonly close?: () => void;
+  /** How long a checkpoint may be absent (with later ones held) before it is a gap (default: the driver's, 300 s). */
+  readonly holeWindowMs?: number;
 }
 
 /** Largest archive response accepted (as in the Rust SDK). */
@@ -407,6 +409,8 @@ export interface ArchiveOptions {
   readonly host?: string;
   /** The caller's read mask (undefined: full checkpoint). */
   readonly readMask: readonly string[] | undefined;
+  /** How long a checkpoint may be absent (with later ones held) before it is a gap (default 300 s). For tests. */
+  readonly holeWindowMs?: number | undefined;
   /** First wait before a short page is asked again (doubling; default 1000 ms). For tests. */
   readonly shortRetryBaseMs?: number | undefined;
   /** Each failed page attempt (it is retried after `retryInMs`): for diagnostics. */
@@ -428,8 +432,19 @@ const ITEM_LIMIT = 1;
 /** `QueryEndReason.LEDGER_TIP`: the range runs past what the archive holds. */
 const LEDGER_TIP = 5;
 
-/** Longest wait between two messages of a `ListCheckpoints` answer (as the Rust SDK). */
+/** Longest wait for a `ListCheckpoints` call's response headers (as the Rust SDK). */
+const FIRST_RESPONSE_MS = 30_000;
+/**
+ * Longest wait between two messages of a `ListCheckpoints` answer, at first.
+ * grpc-js shows whole messages only (no byte progress), and one epoch-change
+ * checkpoint is 10-20 MB: when an attempt is cut by this without bringing
+ * anything, the next attempt at that page waits twice as long (up to
+ * MESSAGE_DEADLINE_MAX_MS), so a large message on a slow link gets through,
+ * while a stalled answer is still retried in 30 s. A dead connection is the
+ * HTTP/2 keepalive's (10 s + 10 s).
+ */
 const MESSAGE_DEADLINE_MS = 30_000;
+const MESSAGE_DEADLINE_MAX_MS = 480_000;
 /** Asks of a short page before its absent checkpoints count as missing (~30 s): a gap is final for the caller. */
 const SHORT_ASKS = 5;
 
@@ -474,47 +489,47 @@ export const archiveHistory = (options: ArchiveOptions): HistorySource => {
   });
 
   /**
-   * What the archive has in `[start, end)`: one `ListCheckpoints` call,
-   * continued from its cursor if the server stops at an item limit of its
-   * own. Whatever arrived is kept in `out` even when the call fails, so a
-   * retry continues after it rather than starting over (a slow link still
-   * makes progress). Succeeds with the stream's `QueryEnd` reason; a stream
-   * without one, a cursor that doesn't move, or more checkpoints than the
-   * range holds are errors.
+   * One `ListCheckpoints` call for `[start, end)`, continued from its cursor
+   * if the server stops at an item limit of its own; each checkpoint goes to
+   * `onCheckpoint` as it arrives (it is released downstream as soon as
+   * everything before it in the page is known, so a slow link delivers
+   * steadily, and a retry continues after what arrived). Succeeds with the
+   * stream's `QueryEnd` reason; a stream without one, a cursor that doesn't
+   * move, or more checkpoints than the range holds are errors.
    */
   const list = (
     start: bigint,
     end: bigint,
-    out: Checkpoint[],
+    onCheckpoint: (c: Checkpoint) => void,
+    messageDeadlineMs: number = MESSAGE_DEADLINE_MS,
   ): Effect.Effect<number, ArchiveError> =>
     Effect.gen(function* () {
       const { client: c } = yield* getClient;
       const len = Number(end - start);
-      const base = out.length;
       return yield* Effect.tryPromise({
         try: async (signal) => {
           let after: Uint8Array | undefined;
-          // Between two messages of an answer, as the Rust SDK: a call that stalls mid-stream is aborted.
+          // Checkpoints this call received (re-reads included): bounded by the range.
+          let received = 0;
+          // To the response headers: FIRST_RESPONSE_MS; then between two messages:
+          // MESSAGE_DEADLINE_MS (a stalled answer is aborted).
           const idle = new AbortController();
           signal.addEventListener("abort", () => idle.abort(signal.reason), {
             once: true,
           });
           let idleTimer: ReturnType<typeof setTimeout> | undefined;
-          const touch = () => {
+          // Why the idle timer aborted the call (grpc-js reports only "Cancelled on client").
+          let stalled: string | undefined;
+          const touch = (ms: number, what: string) => {
             clearTimeout(idleTimer);
-            idleTimer = setTimeout(
-              () =>
-                idle.abort(
-                  new Error(
-                    `stalled: no message for ${MESSAGE_DEADLINE_MS / 1000} s`,
-                  ),
-                ),
-              MESSAGE_DEADLINE_MS,
-            );
+            idleTimer = setTimeout(() => {
+              stalled = `stalled: ${what} for ${ms / 1000} s`;
+              idle.abort(new Error(stalled));
+            }, ms);
           };
           try {
             for (;;) {
-              touch();
+              touch(FIRST_RESPONSE_MS, "no response");
               const call = c.ledgerService.listCheckpoints(
                 {
                   startCheckpoint: start,
@@ -523,52 +538,46 @@ export const archiveHistory = (options: ArchiveOptions): HistorySource => {
                   options: { limit: len, ...(after ? { after } : {}) },
                 },
                 // The whole call: generous (a slow link isn't cut off mid-page); stalls are the idle timer's.
-              { abort: idle.signal, timeout: 600_000 },
+                { abort: idle.signal, timeout: 600_000 },
+              );
+              void call.headers?.then?.(
+                () => touch(messageDeadlineMs, "no message"),
+                () => {},
               );
               let reason: number | undefined;
               let cursor: Uint8Array | undefined;
-              const before = out.length;
+              let last: bigint | undefined;
+              const before = received;
               for await (const m of call.responses) {
-                touch();
+                touch(messageDeadlineMs, "no message");
                 if (m.checkpoint) {
-                  if (out.length - base >= len)
-                    throw new Error(`more than ${len} checkpoints`);
-                  out.push(m.checkpoint);
+                  if (received >= len) throw new Error(`more than ${len} checkpoints`);
+                  received++;
+                  last = m.checkpoint.sequenceNumber;
+                  onCheckpoint(m.checkpoint);
                 }
                 if (m.watermark?.cursor) cursor = m.watermark.cursor;
                 if (m.end) reason = m.end.reason ?? 0;
               }
               // `end` is set exactly once on a stream that finished: one without it was cut short.
-              if (reason === undefined)
-                throw new Error("ended without QueryEnd");
-              const last = out.at(-1)?.sequenceNumber;
-              if (
-                reason !== ITEM_LIMIT ||
-                (last !== undefined && last >= end - 1n)
-              )
-                return reason;
+              if (reason === undefined) throw new Error("ended without QueryEnd");
+              if (reason !== ITEM_LIMIT || (last !== undefined && last >= end - 1n)) return reason;
               // Continue after the cursor, only if it moved and brought something.
-              if (
-                cursor === undefined ||
-                (after !== undefined && sameBytes(cursor, after)) ||
-                out.length === before
-              )
+              if (cursor === undefined || (after !== undefined && sameBytes(cursor, after)) || received === before)
                 throw new Error("item limit without progress");
               after = cursor;
             }
+          } catch (e) {
+            throw stalled !== undefined ? new Error(stalled) : e;
           } finally {
             clearTimeout(idleTimer);
           }
         },
         catch: (cause) => {
-          const message =
-            cause instanceof Error ? cause.message : String(cause);
+          const message = cause instanceof Error ? cause.message : String(cause);
           // A call that timed out or stalled may be on a dead connection: the next attempt gets a new one.
           if (/deadline|stalled|abort|cancel/i.test(message)) resetClient();
-          return new ArchiveError({
-            message: `checkpoints ${start}..${end - 1n}: ${message}`,
-            cause,
-          });
+          return new ArchiveError({ message: `checkpoints ${start}..${end - 1n}: ${message}`, cause });
         },
       }).pipe(
         // Enforced here too, whatever the transport does with `timeout`
@@ -576,110 +585,98 @@ export const archiveHistory = (options: ArchiveOptions): HistorySource => {
         Effect.timeoutOrElse({
           duration: "610 seconds",
           orElse: () =>
-            Effect.fail(
-              new ArchiveError({
-                message: `checkpoints ${start}..${end - 1n}: no answer in 610 s`,
-              }),
-            ),
+            Effect.fail(new ArchiveError({ message: `checkpoints ${start}..${end - 1n}: no answer in 610 s` })),
         }),
       );
     });
 
-  /** `[start, end)` as items: each checkpoint (filled and pruned), `missing`, or (past the archive's tip, after the last one held) `notYet`. */
-  const items = (
-    start: bigint,
-    end: bigint,
-    got: Checkpoint[],
-    pastTip: boolean,
-  ): Effect.Effect<HistoryItem[], ArchiveError> => {
-    const bySeq = new Map<bigint, Checkpoint>();
-    let heldTo: bigint | undefined;
-    for (const checkpoint of got) {
-      const seq = checkpoint.sequenceNumber;
-      if (seq === undefined || seq < start || seq >= end || bySeq.has(seq)) {
-        return Effect.fail(
-          new ArchiveError({
-            message: `archive returned checkpoint ${seq} for ${start}..${end - 1n}`,
-          }),
-        );
-      }
-      bySeq.set(seq, checkpoint);
-      if (heldTo === undefined || seq > heldTo) heldTo = seq;
-    }
-    const out: HistoryItem[] = [];
-    for (let seq = start; seq < end; seq++) {
-      const checkpoint = bySeq.get(seq);
-      if (!checkpoint) {
-        out.push(
-          pastTip && (heldTo === undefined || seq > heldTo)
-            ? { type: "notYet", seq }
-            : { type: "missing", seq },
-        );
-        continue;
-      }
-      if (p.fill) fillObjectTypes(checkpoint);
-      out.push({
-        type: "checkpoint",
-        seq,
-        checkpoint: pruneTo(checkpoint, kept),
-      });
-    }
-    return Effect.succeed(out);
-  };
-
   /**
-   * One page: failures retried (6 attempts in all, each continuing after
-   * what already arrived, each one reported to `onRetry`); a short page
-   * asked again `SHORT_ASKS` times (~30 s) before its absent checkpoints
-   * count as missing (a gap is final for the caller); `LEDGER_TIP`: the rest isn't there yet.
+   * One page, into `emit` in order, each checkpoint (filled and pruned) as
+   * soon as everything before it is known: failures retried (6 attempts in
+   * all, each continuing after what arrived, each reported to `onRetry`);
+   * absent checkpoints (a short page, or holes below what a `LEDGER_TIP`
+   * answer held) asked again `SHORT_ASKS` times (~30 s) before they are
+   * `missing` (the driver decides when missing is a gap); after the last one
+   * held of a `LEDGER_TIP` answer: `notYet`, and the page ends there.
    */
   const page = (
     start: bigint,
     end: bigint,
-  ): Effect.Effect<HistoryItem[], ArchiveError> =>
+    emit: (item: HistoryItem) => void,
+  ): Effect.Effect<void, ArchiveError> =>
     Effect.gen(function* () {
-      const got: Checkpoint[] = [];
+      // Everything before `next` is released; `pending`: arrived after it.
+      let next = start;
+      const pending = new Map<bigint, Checkpoint>();
+      const release = (seq: bigint, checkpoint: Checkpoint) => {
+        if (p.fill) fillObjectTypes(checkpoint);
+        emit({ type: "checkpoint", seq, checkpoint: pruneTo(checkpoint, kept) });
+      };
+      const onCheckpoint = (checkpoint: Checkpoint) => {
+        const seq = checkpoint.sequenceNumber;
+        if (seq === undefined || seq < start || seq >= end)
+          throw new Error(`archive returned checkpoint ${seq} for ${start}..${end - 1n}`);
+        if (seq < next || pending.has(seq)) return; // a re-read
+        pending.set(seq, checkpoint);
+        for (let c = pending.get(next); c !== undefined; c = pending.get(next)) {
+          pending.delete(next);
+          release(next, c);
+          next++;
+        }
+      };
+      /** Absent ones are missing, up to the last held; after it, missing too, or (`pastTip`) not there yet. */
+      const giveUp = (pastTip: boolean) => {
+        for (; next < end; next++) {
+          const c = pending.get(next);
+          if (c !== undefined) {
+            pending.delete(next);
+            release(next, c);
+          } else if (pastTip && pending.size === 0) {
+            emit({ type: "notYet", seq: next });
+            next = end;
+            return;
+          } else emit({ type: "missing", seq: next });
+        }
+      };
       let errors = 0;
       let short = 0;
       let backoffMs = 250;
+      let messageDeadlineMs = MESSAGE_DEADLINE_MS;
       for (;;) {
-        // After the run that arrived from the page's start (anything out of order is checked by `items`).
-        const held = new Set(got.map((c) => c.sequenceNumber));
-        let from = start;
-        while (held.has(from)) from++;
-        if (from >= end) return yield* items(start, end, got, false);
-        const more: Checkpoint[] = [];
-        const result = yield* Effect.result(list(from, end, more));
-        // A retry after a hole re-reads what follows it: keep each once.
-        for (const c of more)
-          if (c.sequenceNumber === undefined || !held.has(c.sequenceNumber))
-            got.push(c);
-        const complete = BigInt(got.length) === end - start;
+        if (next >= end) return;
+        const from = next;
+        const held = pending.size;
+        const result = yield* Effect.result(list(from, end, onCheckpoint, messageDeadlineMs));
+        if (next >= end) return;
+        // Cut between messages with nothing new: perhaps one large message on a slow link; give it longer.
+        const progressed = next > from || pending.size > held;
+        if (result._tag === "Failure" && !progressed && /stalled: no message/.test(result.failure.message))
+          messageDeadlineMs = Math.min(messageDeadlineMs * 2, MESSAGE_DEADLINE_MAX_MS);
+        else if (progressed) messageDeadlineMs = MESSAGE_DEADLINE_MS;
         let waitMs: number;
         if (result._tag === "Success") {
-          if (complete || short >= SHORT_ASKS)
-            return yield* items(start, end, got, false);
-          if (result.success === LEDGER_TIP)
-            return yield* items(start, end, got, true);
+          // Past the archive's tip, and nothing held after the gap: the rest isn't there yet.
+          if (result.success === LEDGER_TIP && pending.size === 0) {
+            emit({ type: "notYet", seq: next });
+            return;
+          }
+          if (short >= SHORT_ASKS) return giveUp(result.success === LEDGER_TIP);
           short++;
           waitMs = (options.shortRetryBaseMs ?? 1000) * 2 ** (short - 1); // 1, 2, 4, 8, 16 s
-          yield* Effect.sync(() => options.onRetry?.(`checkpoints ${from}..${end - 1n}: ${got.length} of ${end - start}; asking again`, waitMs));
+          yield* Effect.sync(() =>
+            options.onRetry?.(`checkpoints ${from}..${end - 1n}: ${from} absent (${pending.size} after it held); asking again (${short} of ${SHORT_ASKS})`, waitMs),
+          );
         } else {
           if (++errors >= 6) return yield* Effect.fail(result.failure);
           waitMs = backoffMs;
           backoffMs = Math.min(backoffMs * 2, 4_000);
-          yield* Effect.sync(() =>
-            options.onRetry?.(
-              `${result.failure.message} (attempt ${errors} of 6)`,
-              waitMs,
-            ),
-          );
+          yield* Effect.sync(() => options.onRetry?.(`${result.failure.message} (attempt ${errors} of 6)`, waitMs));
         }
         yield* Effect.sleep(waitMs);
       }
     });
-
   return {
+    ...(options.holeWindowMs === undefined ? {} : { holeWindowMs: options.holeWindowMs }),
     close() {
       void client?.then((c) => c.close?.()).catch(() => {});
       client = undefined;
@@ -718,17 +715,37 @@ export const archiveHistory = (options: ArchiveOptions): HistorySource => {
           : Effect.succeed(info.checkpointHeight),
       ),
     ),
-    // Pages in order, `concurrency` ahead; a failure ends the stream and
-    // interrupts the pages still in flight.
+    // Pages in order, `concurrency` in flight, each read by its own fiber
+    // (so it keeps reading while an earlier one is consumed) and handed over
+    // item by item; a failure ends the stream, and ending it interrupts the
+    // pages in flight.
     checkpoints: (from, to) =>
-      Stream.fromIterable(
-        (function* () {
-          for (let start = from; start < to; start += PAGE)
-            yield [start, start + PAGE < to ? start + PAGE : to] as const;
-        })(),
-      ).pipe(
-        Stream.mapEffect(([start, end]) => page(start, end), { concurrency }),
-        Stream.flatMap((page) => Stream.fromIterable(page)),
+      Stream.callback<HistoryItem, ArchiveError>(
+        (out) =>
+          Effect.gen(function* () {
+            const inflight: Queue.Queue<HistoryItem, ArchiveError | Cause.Done>[] = [];
+            let nextStart = from;
+            for (;;) {
+              while (inflight.length < concurrency && nextStart < to) {
+                const start = nextStart;
+                const end = start + PAGE < to ? start + PAGE : to;
+                nextStart = end;
+                const q = yield* Queue.unbounded<HistoryItem, ArchiveError | Cause.Done>();
+                yield* page(start, end, (item) => void Queue.offerUnsafe(q, item)).pipe(
+                  Effect.matchEffect({ onSuccess: () => Queue.end(q), onFailure: (e) => Queue.fail(q, e) }),
+                  Effect.forkScoped,
+                );
+                inflight.push(q);
+              }
+              const q = inflight[0];
+              if (q === undefined) return yield* Queue.end(out);
+              const r = yield* Effect.result(Queue.take(q));
+              if (r._tag === "Success") yield* Queue.offer(out, r.success);
+              else if (Cause.isDone(r.failure)) inflight.shift();
+              else return yield* Queue.fail(out, r.failure);
+            }
+          }),
+        { bufferSize: 16, strategy: "suspend" },
       ),
   };
 };

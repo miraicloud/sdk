@@ -430,6 +430,7 @@ const scripted = (steps: Step[], connects: (string | undefined)[]): LiveSource<A
 });
 /** History serving `[from, to)` with `missing` absent, failing once at `failAt`; `tip`: its newest checkpoint, if it says. */
 const fakeHistory = (missing: number[], failAt: number | undefined, calls: string[], tip?: number): HistorySource => ({
+  holeWindowMs: 0,
   ...(tip === undefined ? {} : { tip: Effect.succeed(BigInt(tip)) }),
   checkpoints: (from, to) =>
     Stream.suspend(() => {

@@ -40,6 +40,11 @@ pub(crate) struct Deadlines {
     /// Each archive item; a page holds 50, and epoch-change checkpoints are
     /// 10-20 MB.
     pub history_item: Duration,
+    /// How long the archive may lack a checkpoint it holds checkpoints
+    /// after (asked again all along) before it is reported as a gap: a gap
+    /// is final for the caller, and the archive's absences are almost always
+    /// transient (a replica or an index behind).
+    pub archive_hole: Duration,
 }
 
 impl Default for Deadlines {
@@ -55,6 +60,7 @@ impl Default for Deadlines {
             // between messages); a slow but working link must not lose its
             // page here (at 90 s, a throttled link delivered nothing).
             history_item: Duration::from_secs(660),
+            archive_hole: Duration::from_secs(300),
         }
     }
 }
@@ -232,6 +238,7 @@ async fn backfill<E: Item>(
     oldest: u64,
     out: &mpsc::Sender<Result<E, Error>>,
     deadlines: Deadlines,
+    hole: &mut Option<(u64, tokio::time::Instant)>,
 ) -> Option<(u64, bool)> {
     // An unknown tip (or one that doesn't answer in time): up to the ring,
     // as far as is known to be needed.
@@ -279,11 +286,35 @@ async fn backfill<E: Item>(
                 // `next` moves past it only once it is reported as a gap.
                 missing = Some(match missing {
                     Some((a, _)) => (a, seq),
-                    None => (seq, seq),
+                    None => {
+                        // A new hole: a gap only once it has lasted `archive_hole`
+                        // (asked again all along); until then stop before it.
+                        let since = match *hole {
+                            Some((h, t)) if h == seq => t,
+                            _ => hole.insert((seq, tokio::time::Instant::now())).1,
+                        };
+                        if since.elapsed() < deadlines.archive_hole {
+                            tracing::warn!(
+                                seq,
+                                absent_for = ?since.elapsed(),
+                                gap_after = ?deadlines.archive_hole,
+                                "checkpoint not in the archive; asking again"
+                            );
+                            return Some((seq, seq >= oldest));
+                        }
+                        (seq, seq)
+                    }
                 });
             }
             Some(Ok(HistoryItem::Checkpoint(seq, cp))) => {
                 if let Some((a, b)) = missing.take() {
+                    tracing::warn!(
+                        from = a,
+                        to = b,
+                        "not in the archive for {:?}: a gap",
+                        deadlines.archive_hole
+                    );
+                    *hole = None;
                     send!(E::gap(a, b));
                 }
                 send!(E::from_history(seq, cp));
@@ -325,6 +356,8 @@ pub(crate) async fn run<E: Item>(
     // Oldest-Checkpoint, or a probed tip): what a 410 or a frame may claim
     // without a probe (`believable`).
     let mut known: Option<u64> = start.and_then(|s| s.checked_sub(1));
+    // A checkpoint the archive lacks, and since when (across backfills).
+    let mut hole: Option<(u64, tokio::time::Instant)> = None;
     // When the last connection opened: reconnecting to renew a token waits
     // until a second after it (very short-lived tokens can't make a storm).
     let mut connected_at: Option<tokio::time::Instant> = None;
@@ -389,7 +422,7 @@ pub(crate) async fn run<E: Item>(
                         continue;
                     }
                     (Some(n), Some(h)) => {
-                        match backfill(h.as_ref(), n, oldest, &out, deadlines).await {
+                        match backfill(h.as_ref(), n, oldest, &out, deadlines, &mut hole).await {
                             None => return,
                             Some((reached, done)) => {
                                 if reached > n {
@@ -715,7 +748,10 @@ mod tests {
             start,
             None,
             tx,
-            Deadlines::default(),
+            Deadlines {
+                archive_hole: Duration::ZERO,
+                ..Deadlines::default()
+            },
         ));
         let mut got = vec![];
         while got.len() < n {
@@ -979,7 +1015,10 @@ mod tests {
             Some(1),
             None,
             tx,
-            Deadlines::default(),
+            Deadlines {
+                archive_hole: Duration::ZERO,
+                ..Deadlines::default()
+            },
         ));
         for want in ["1", "2", "3"] {
             assert_eq!(rx.recv().await.unwrap().unwrap().show(), want);
@@ -1211,7 +1250,10 @@ mod tests {
             Some(1),
             None,
             tx,
-            Deadlines::default(),
+            Deadlines {
+                archive_hole: Duration::ZERO,
+                ..Deadlines::default()
+            },
         ));
         let mut got = vec![];
         while got.len() < 3 {
@@ -1254,7 +1296,10 @@ mod tests {
             Some(7),
             None,
             tx,
-            Deadlines::default(),
+            Deadlines {
+                archive_hole: Duration::ZERO,
+                ..Deadlines::default()
+            },
         ));
         let mut got = vec![];
         while got.len() < 2 {
@@ -1312,7 +1357,10 @@ mod tests {
             Some(1),
             None,
             tx,
-            Deadlines::default(),
+            Deadlines {
+                archive_hole: Duration::ZERO,
+                ..Deadlines::default()
+            },
         ));
         let mut got = vec![];
         while got.len() < 3 {

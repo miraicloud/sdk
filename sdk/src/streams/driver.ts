@@ -112,6 +112,9 @@ type Outcome =
 /** A frame that would skip past the cursor without a gap: treat the connection as broken. */
 class Skip extends Data.TaggedError("Skip")<{ readonly reason: string }> {}
 
+/** The archive lacks `seq` (it holds later ones), not yet for long enough to be a gap. */
+class HoleWait extends Data.TaggedError("HoleWait")<{ readonly seq: bigint; readonly forMs: number }> {}
+
 /**
  * Items buffered between the driver and the consumer; beyond this, reading
  * pauses. Few: memory is bounded by items, and an epoch-change checkpoint
@@ -140,6 +143,12 @@ const monotonic = Effect.sync(() => performance.now());
 // A backstop only, past the archive client's own per-call limit (stalls are caught there:
 // 30 s to the first response, 30 s between messages); a slow but working link must not lose its page.
 const HISTORY_ITEM_MS = 660_000;
+/**
+ * How long the archive may lack a checkpoint it holds checkpoints after
+ * (asked again all along) before it is reported as a gap: a gap is final for
+ * the caller, and the archive's absences are almost always transient.
+ */
+const ARCHIVE_HOLE_MS = 300_000;
 /** As `checkpoints.ts`: the most a `Retry-After` can make a subscription wait. */
 const MAX_RETRY_AFTER_MS = 30_000;
 
@@ -158,6 +167,8 @@ export const drive = <C extends CheckpointLike, G extends GapLike, E>(cfg: Drive
         // Oldest-Checkpoint, or a probed tip): what a 410 or a frame may claim
         // without a probe (`believable`).
         let known: bigint | undefined = cursor;
+        // A checkpoint the archive lacks, and since when (ms, monotonic; across backfills).
+        let hole: { seq: bigint; ms: number } | undefined;
         // The progress watchdog's clock: the last time the cursor moved, and
         // whether an item is waiting on the consumer (that time isn't the server's).
         let progressedMs = 0;
@@ -288,13 +299,29 @@ export const drive = <C extends CheckpointLike, G extends GapLike, E>(cfg: Drive
               Stream.takeWhile((item) => item.type !== "notYet"),
               Stream.runForEach((item) => {
                 if (item.type === "missing") {
-                  missing = missing ? [missing[0], item.seq] : [item.seq, item.seq];
-                  return Effect.void;
+                  if (missing) {
+                    missing = [missing[0], item.seq];
+                    return Effect.void;
+                  }
+                  // A new hole: a gap only once it has lasted ARCHIVE_HOLE_MS (asked again all along); until then stop before it.
+                  return Effect.flatMap(monotonic, (now) => {
+                    if (hole?.seq !== item.seq) hole = { seq: item.seq, ms: now };
+                    if (now - hole.ms < (history.holeWindowMs ?? ARCHIVE_HOLE_MS)) return Effect.fail(new HoleWait({ seq: item.seq, forMs: now - hole.ms }));
+                    missing = [item.seq, item.seq];
+                    return Effect.void;
+                  });
                 }
+                if (missing) hole = undefined;
                 return flushMissing.pipe(Effect.andThen(emit(cfg.decode.message(item.seq, item.checkpoint))));
               }),
               Effect.result,
             );
+            if (result._tag === "Failure" && result.failure instanceof HoleWait) {
+              const { seq, forMs } = result.failure;
+              // From the stream's oldest on, the stream serves it.
+              if (seq >= oldest) return undefined;
+              return `archive: checkpoint ${seq} absent for ${Math.round(forMs / 1000)} s; asking again (a gap after ${(history.holeWindowMs ?? ARCHIVE_HOLE_MS) / 1000} s)`;
+            }
             if (result._tag === "Failure") return `archive: ${result.failure.message}`;
             // Not reported as a gap: the cursor stays before them. From the stream's oldest on, the stream serves them; older, history is asked again.
             if (missing !== undefined && missing[0] < oldest) return `archive: checkpoints ${missing[0]}..=${missing[1]} not in history yet`;
