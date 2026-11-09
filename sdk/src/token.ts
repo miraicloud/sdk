@@ -20,11 +20,21 @@ import { SignerError } from "@miraicloud/core/signer";
 export interface IssuedToken {
   readonly token: string;
   readonly id: string;
+  /** When it expires (ms since the epoch, the server's clock). */
   readonly expiresAt: number;
   readonly ancestors: ReadonlyArray<string>;
-  /** When to exchange again. */
+  /**
+   * When to exchange again, and when it expires, on this process's
+   * monotonic clock (`monotonicNow`): its lifetime is measured on the
+   * server's clock (its `Date` header), so a client clock that is off, or
+   * jumps, changes nothing.
+   */
   readonly refreshAt: number;
+  readonly validUntil: number;
 }
+
+/** A clock that only moves forward (ms): wall-clock jumps don't touch it. */
+export const monotonicNow = (): number => performance.now();
 
 export type TokenError = Unauthorized | Forbidden | Invalid | RateLimited | Unavailable | SignerError;
 
@@ -78,33 +88,44 @@ export const exchange = (auth: DelegatedAuth, endpoint: string, client: HttpClie
     const base = endpoint.replace(/\/+$/, "");
     const body = JSON.stringify({ chain: auth.chain, ...(auth.lifetimeSeconds !== undefined ? { expiresIn: auth.lifetimeSeconds } : {}), ...(auth.scopes !== undefined ? { scopes: auth.scopes } : {}) });
     for (let attempt = 0; ; attempt++) {
-      const issuedAt = Date.now();
+      // Sent at (the lifetime is counted from here: conservative).
+      const sentAt = monotonicNow();
       const headers = yield* signedHeaders(auth.signer.sign, { audience: new URL(base).origin, address: auth.signer.address, method: "POST", path: TOKEN_PATH, body });
       const request = HttpClientRequest.post(`${base}${TOKEN_PATH}`).pipe(HttpClientRequest.setHeaders({ ...headers, "content-type": "application/json" }), HttpClientRequest.bodyText(body, "application/json"));
       const outcome = yield* client.execute(request).pipe(
-        Effect.flatMap((res) => Effect.map(res.text, (text) => ({ status: res.status, text, retryAfter: Number(res.headers["retry-after"]) }))),
+        Effect.flatMap((res) => Effect.map(res.text, (text) => ({ status: res.status, text, retryAfter: Number(res.headers["retry-after"]), date: Date.parse(res.headers["date"] ?? "") }))),
         Effect.mapError((e) => new Unavailable({ message: `cannot reach ${base}: ${e.message}` })),
         Effect.result,
       );
       let failure: TokenError;
       let waitMs = 1000 * 2 ** attempt;
       if (outcome._tag === "Success") {
-        const { status, text, retryAfter } = outcome.success;
+        const { status, text, retryAfter, date } = outcome.success;
         let parsed: Record<string, unknown> = {};
         try {
           parsed = JSON.parse(text) as Record<string, unknown>;
         } catch {}
         if (status === 200 && typeof parsed.token === "string" && typeof parsed.expiresAt === "number") {
+          // The lifetime on the server's clock: its Date header when this
+          // process's clock is off by more than the header's 1 s resolution
+          // (2 s, to be safe), else this clock (finer).
+          const localNow = Date.now();
+          const serverNow = Number.isFinite(date) && Math.abs(date - localNow) > 2_000 ? date : localNow;
+          // No usable lifetime (no Date header and a clock far off, or a Date far from the clock
+          // `expiresAt` is on): assume the server's shortest (60 s), a 401 renewing it if not.
+          const measured = parsed.expiresAt - serverNow;
+          const lifetime = measured > 0 ? measured : 60_000;
           return {
             token: parsed.token,
             id: String(parsed.id ?? ""),
             expiresAt: parsed.expiresAt,
             ancestors: Array.isArray(parsed.ancestors) ? (parsed.ancestors as string[]) : [],
-            refreshAt: refreshAt(issuedAt, parsed.expiresAt),
+            refreshAt: refreshAt(sentAt, sentAt + lifetime),
+            validUntil: sentAt + lifetime,
           };
         }
         failure = errorOf(status, parsed);
-        if (Number.isFinite(retryAfter) && retryAfter > 0) waitMs = Math.max(waitMs, retryAfter * 1000);
+        if (Number.isFinite(retryAfter) && retryAfter > 0) waitMs = Math.max(waitMs, Math.min(retryAfter, 60) * 1000);
       } else failure = outcome.failure;
       if ((failure._tag !== "RateLimited" && failure._tag !== "Unavailable") || attempt >= 3) return yield* Effect.fail(failure);
       yield* Effect.sleep(waitMs);
@@ -145,10 +166,10 @@ const join = (s: State, flight: Flight): Effect.Effect<Exit.Exit<IssuedToken, To
 export const tokenFor = (auth: DelegatedAuth, endpoint: string, client: HttpClient.HttpClient): Effect.Effect<IssuedToken, TokenError> =>
   Effect.suspend(() => {
     const s = stateOf(auth);
-    const now = Date.now();
+    const now = monotonicNow();
     if (s.current !== undefined && now < s.current.refreshAt) return Effect.succeed(s.current);
     // Due but still valid: used while the refresh runs, so a slow or failing exchange (a 429 waits out Retry-After) holds nothing up.
-    if (s.current !== undefined && now < s.current.expiresAt) {
+    if (s.current !== undefined && now < s.current.validUntil) {
       flightFor(s, auth, endpoint, client);
       return Effect.succeed(s.current);
     }
@@ -164,14 +185,15 @@ export const tokenFor = (auth: DelegatedAuth, endpoint: string, client: HttpClie
  * doesn't exist yet while its own is still valid.
  */
 export const renewal = (auth: DelegatedAuth, endpoint: string, client: HttpClient.HttpClient, used: IssuedToken): Effect.Effect<void> => {
-  const expiry = Effect.suspend(() => Effect.sleep(Math.max(0, used.expiresAt - Date.now())));
+  const expiry = Effect.suspend(() => Effect.sleep(Math.max(0, used.validUntil - monotonicNow())));
   const fresh = Effect.suspend(() => {
     const s = stateOf(auth);
-    if (s.current !== undefined && s.current.token !== used.token && Date.now() < s.current.refreshAt) return Effect.void;
+    if (s.current !== undefined && s.current.token !== used.token && monotonicNow() < s.current.refreshAt) return Effect.void;
     return Effect.flatMap(join(s, flightFor(s, auth, endpoint, client)), (exit) => (Exit.isSuccess(exit) && exit.value.token !== used.token ? Effect.void : Effect.never));
   });
   return Effect.andThen(
-    Effect.suspend(() => Effect.sleep(Math.max(0, used.refreshAt - Date.now()))),
+    // At least a second: a renewal can never spin (a key whose lifetime is 0 renews once a second at most).
+    Effect.suspend(() => Effect.sleep(Math.max(1000, used.refreshAt - monotonicNow()))),
     Effect.raceFirst(fresh, expiry),
   );
 };

@@ -319,7 +319,8 @@ impl Builder {
 
     /// Reconnect (resuming from the cursor) when a connection delivers no
     /// checkpoint or gap for this long, even if keepalives still arrive
-    /// (default 60 s; Mainnet makes ~4 checkpoints a second). A server
+    /// (default 30 s, inside the stream's ~49 s ring; Mainnet makes ~4
+    /// checkpoints a second). A server
     /// that stays connected but stops sending checkpoints can't freeze a
     /// subscription.
     pub fn progress_timeout(mut self, timeout: Duration) -> Self {
@@ -359,6 +360,9 @@ impl Builder {
     }
 }
 
+/// Items buffered between the connection and the consumer.
+const BUFFERED: usize = 4;
+
 /// Ordered events. Ends only after yielding an [`Error`]. Bounded: when the
 /// consumer falls behind, reading from the network pauses.
 pub struct Subscription {
@@ -380,7 +384,10 @@ struct Sub<E> {
 
 impl<E: driver::Item> Sub<E> {
     fn new(client: &Client) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        // Few items: memory is bounded by items, and an epoch-change
+        // checkpoint is 10-20 MB decoded (32 of them OOM-killed a 256 MB
+        // machine).
+        let (tx, rx) = tokio::sync::mpsc::channel(BUFFERED);
         let task = tokio::spawn(driver::run(
             client.source.clone(),
             client.history.clone(),

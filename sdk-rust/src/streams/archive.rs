@@ -287,6 +287,9 @@ pub(crate) enum Item {
     Checkpoint(u64, Box<Checkpoint>),
     /// Not in the archive.
     Missing(u64),
+    /// Past the archive's tip (`LEDGER_TIP`): not there yet, so not a gap.
+    /// Nothing after it is asked for.
+    NotYet(u64),
 }
 
 /// Ordered history for a range. Abstracted for tests.
@@ -304,15 +307,25 @@ pub(crate) trait History: Send + Sync + 'static {
 pub(crate) const PAGE: u64 = 50;
 
 /// A `ListCheckpoints` call's first response, enforced here (tonic only
-/// sends `grpc-timeout` to the server).
-const CALL_DEADLINE: Duration = Duration::from_secs(120);
+/// sends `grpc-timeout` to the server): an archive that doesn't answer is
+/// retried (and logged) within 30 s, not after a page's whole budget.
+const FIRST_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 /// Between two messages of one `ListCheckpoints` answer.
-const MESSAGE_DEADLINE: Duration = Duration::from_secs(60);
+const MESSAGE_DEADLINE: Duration = Duration::from_secs(30);
+/// A whole call (`grpc-timeout`, which sui-rpc also enforces): generous, so
+/// a slow but working link isn't cut off mid-page (a retry continues after
+/// what arrived anyway).
+const CALL_DEADLINE: Duration = Duration::from_secs(600);
+/// Asks of a short page before its absent checkpoints count as missing: a
+/// gap is final for the caller, so a hole must persist (~30 s).
+const SHORT_ASKS: u32 = 5;
 /// One `GetServiceInfo` (the archive's tip).
 const TIP_DEADLINE: Duration = Duration::from_secs(5);
 
 /// `QueryEndReason::ItemLimit`: the server stopped at its own item limit; resume after the cursor.
 const ITEM_LIMIT: i32 = 1;
+/// `QueryEndReason::LedgerTip`: the range runs past what the archive holds.
+const LEDGER_TIP: i32 = 5;
 
 pub(crate) struct Archive {
     url: String,
@@ -349,42 +362,48 @@ impl Archive {
         })
     }
 
-    /// The checkpoints the archive has in `range`, ascending, each filled
-    /// and masked as it arrives (a page holds only what the caller keeps):
-    /// one `ListCheckpoints` call, continued from its cursor if the server
-    /// stops at an item limit of its own before the end.
+    /// What the archive has in `range`, each filled and masked as it
+    /// arrives (a page holds only what the caller keeps): one
+    /// `ListCheckpoints` call, continued from its cursor if the server stops
+    /// at an item limit of its own. Whatever arrived is returned even when
+    /// the call fails, so a retry continues after it rather than starting
+    /// over (a slow link still makes progress). `Ok(reason)`: the stream's
+    /// `QueryEnd` reason; a stream without one, a cursor that doesn't move,
+    /// or more items than the range holds are errors.
     async fn list(
         mut client: sui_rpc::Client,
         mask: FieldMask,
         range: Range<u64>,
         fill: bool,
         remask: &FieldMaskTree,
-    ) -> Result<Vec<(Option<u64>, Checkpoint)>, tonic::Status> {
-        let mut out = Vec::new();
-        let mut after = None;
+        out: &mut Vec<(Option<u64>, Checkpoint)>,
+    ) -> Result<i32, tonic::Status> {
+        let len = (range.end - range.start) as usize;
+        let mut after: Option<prost::bytes::Bytes> = None;
         loop {
             let mut request = ListCheckpointsRequest::default();
             request.read_mask = Some(mask.clone());
             request.start_checkpoint = Some(range.start);
             request.end_checkpoint = Some(range.end);
             let mut options = QueryOptions::default();
-            options.limit = Some((range.end - range.start) as u32);
-            options.after = after.take();
+            options.limit = Some(len as u32);
+            options.after = after.clone();
             request.options = Some(options);
             let mut request = tonic::Request::new(request);
             // Epoch-change checkpoints are 10-20 MB and slow to serve. The
             // grpc-timeout header only asks the server; the client enforces
-            // its own deadlines (`CALL_DEADLINE`, `MESSAGE_DEADLINE`).
+            // its own deadlines (`FIRST_RESPONSE_DEADLINE`, `MESSAGE_DEADLINE`).
             request.set_timeout(CALL_DEADLINE);
             // `ledger_client()` asks for zstd responses (~6x smaller).
             let mut frames = tokio::time::timeout(
-                CALL_DEADLINE,
+                FIRST_RESPONSE_DEADLINE,
                 client.ledger_client().list_checkpoints(request),
             )
             .await
             .map_err(|_| tonic::Status::deadline_exceeded("ListCheckpoints: no response"))??
             .into_inner();
             let (mut reason, mut cursor) = (None, None);
+            let before = out.len();
             while let Some(frame) = tokio::time::timeout(MESSAGE_DEADLINE, frames.message())
                 .await
                 .map_err(|_| {
@@ -392,6 +411,13 @@ impl Archive {
                 })??
             {
                 if let Some(mut cp) = frame.checkpoint {
+                    if out.len() >= len {
+                        return Err(tonic::Status::internal(format!(
+                            "ListCheckpoints {}..{}: more than {len} checkpoints",
+                            range.start,
+                            range.end - 1
+                        )));
+                    }
                     if fill {
                         fill_object_types(&mut cp);
                     }
@@ -405,38 +431,88 @@ impl Archive {
                     reason = end.reason;
                 }
             }
+            let Some(reason) = reason else {
+                // `end` is set exactly once on a stream that finished: one
+                // without it was cut short, whatever its status.
+                return Err(tonic::Status::unavailable(
+                    "ListCheckpoints: ended without QueryEnd",
+                ));
+            };
             let last = out.last().and_then(|(seq, _)| *seq);
-            if reason != Some(ITEM_LIMIT)
-                || cursor.is_none()
-                || last.is_some_and(|l| l + 1 >= range.end)
-            {
-                return Ok(out);
+            if reason != ITEM_LIMIT || last.is_some_and(|l| l + 1 >= range.end) {
+                return Ok(reason);
+            }
+            // Continue after the cursor, only if it moved and brought something.
+            if cursor.is_none() || cursor == after || out.len() == before {
+                return Err(tonic::Status::unavailable(
+                    "ListCheckpoints: item limit without progress",
+                ));
             }
             after = cursor;
         }
     }
 
-    /// One page: failures retried (6 attempts in all); a short page asked
-    /// again once before its absent checkpoints count as missing (the
-    /// archive can lag the tip).
+    /// One page: failures retried (6 attempts in all, each continuing after
+    /// what already arrived), each one logged; a short page asked again
+    /// `SHORT_ASKS` times over ~30 s before its absent checkpoints count as
+    /// missing (a gap is final for the caller). Returns what it holds, and whether the archive said
+    /// the rest is past its tip (`LEDGER_TIP`: not missing, not there yet).
     async fn page(
         client: sui_rpc::Client,
         mask: FieldMask,
         range: Range<u64>,
         fill: bool,
         remask: &FieldMaskTree,
-    ) -> Result<Vec<(Option<u64>, Checkpoint)>, String> {
+    ) -> Result<(Vec<(Option<u64>, Checkpoint)>, bool), String> {
         let mut backoff = Duration::from_millis(250);
-        let (mut errors, mut short) = (0u32, false);
+        let (mut errors, mut short) = (0u32, 0u32);
+        let mut got: Vec<(Option<u64>, Checkpoint)> = Vec::new();
         loop {
-            match Self::list(client.clone(), mask.clone(), range.clone(), fill, remask).await {
-                Ok(got) if got.len() as u64 == range.end - range.start || short => return Ok(got),
-                Ok(_) => short = true,
+            // After the run that arrived from the page's start (whatever
+            // came out of order is checked by `items`).
+            let held: std::collections::HashSet<u64> =
+                got.iter().filter_map(|(seq, _)| *seq).collect();
+            let mut start = range.start;
+            while held.contains(&start) {
+                start += 1;
+            }
+            if start >= range.end {
+                return Ok((got, false));
+            }
+            let mut more = Vec::new();
+            let result = Self::list(
+                client.clone(),
+                mask.clone(),
+                start..range.end,
+                fill,
+                remask,
+                &mut more,
+            )
+            .await;
+            // A retry after a hole re-reads what follows it: keep each once.
+            got.extend(
+                more.into_iter()
+                    .filter(|(seq, _)| seq.is_none_or(|s| !held.contains(&s))),
+            );
+            let complete = got.len() as u64 == range.end - range.start;
+            match result {
+                Ok(_) if complete => return Ok((got, false)),
+                Ok(LEDGER_TIP) => return Ok((got, true)),
+                Ok(_) if short >= SHORT_ASKS => return Ok((got, false)),
+                Ok(_) => {
+                    short += 1;
+                    tracing::warn!(
+                        "archive ListCheckpoints {start}..{}: {} of {} checkpoints; asking again (holes become gaps after {SHORT_ASKS} asks)",
+                        range.end - 1,
+                        got.len(),
+                        range.end - range.start
+                    );
+                }
                 Err(s) => {
                     errors += 1;
                     let e = format!(
                         "archive ListCheckpoints {}..{}: {:?}: {}",
-                        range.start,
+                        start,
                         range.end - 1,
                         s.code(),
                         s.message()
@@ -444,11 +520,11 @@ impl Archive {
                     if errors >= 6 {
                         return Err(e);
                     }
-                    tracing::debug!("{e}; retrying");
+                    tracing::warn!("{e}; retrying (attempt {errors} of 6)");
                 }
             }
-            tokio::time::sleep(if short {
-                Duration::from_millis(250)
+            tokio::time::sleep(if short > 0 && errors == 0 {
+                Duration::from_secs(1 << (short - 1)) // 1, 2, 4, 8, 16 s
             } else {
                 backoff
             })
@@ -459,7 +535,11 @@ impl Archive {
 
     /// `range` as items: each checkpoint (already filled and masked) or
     /// `Missing`.
-    fn items(range: Range<u64>, got: Vec<(Option<u64>, Checkpoint)>) -> Result<Vec<Item>, String> {
+    fn items(
+        range: Range<u64>,
+        got: Vec<(Option<u64>, Checkpoint)>,
+        past_tip: bool,
+    ) -> Result<Vec<Item>, String> {
         let mut by_seq = HashMap::with_capacity(got.len());
         for (seq, cp) in got {
             match seq {
@@ -475,8 +555,11 @@ impl Archive {
                 }
             }
         }
+        // Past the tip: what follows the last one held isn't there yet.
+        let held_to = by_seq.keys().max().copied();
         Ok(range
             .map(|seq| match by_seq.remove(&seq) {
+                None if past_tip && held_to.is_none_or(|h| seq > h) => Item::NotYet(seq),
                 None => Item::Missing(seq),
                 Some(cp) => Item::Checkpoint(seq, Box::new(cp)),
             })
@@ -510,8 +593,9 @@ impl History for Archive {
             .map(move |page| {
                 let (client, mask, remask) = (client.clone(), mask.clone(), remask.clone());
                 async move {
-                    let got = Self::page(client, mask, page.clone(), fill, &remask).await?;
-                    Self::items(page, got)
+                    let (got, past_tip) =
+                        Self::page(client, mask, page.clone(), fill, &remask).await?;
+                    Self::items(page, got, past_tip)
                 }
             })
             // Pages in order, `concurrency` ahead; an error ends the stream.
@@ -656,19 +740,25 @@ mod tests {
     fn pages_become_items_in_order_with_missing() {
         // Placed by the sequence number recorded before masking.
         let cp = |seq| (Some(seq), Checkpoint::default());
-        let items = Archive::items(10..14, vec![cp(13), cp(10), cp(12)]).unwrap();
-        let got: Vec<_> = items
-            .iter()
-            .map(|i| match i {
-                Item::Checkpoint(s, _) => format!("{s}"),
-                Item::Missing(s) => format!("missing {s}"),
-            })
-            .collect();
-        assert_eq!(got, ["10", "missing 11", "12", "13"]);
+        let show = |items: Vec<Item>| -> Vec<String> {
+            items
+                .iter()
+                .map(|i| match i {
+                    Item::Checkpoint(s, _) => format!("{s}"),
+                    Item::Missing(s) => format!("missing {s}"),
+                    Item::NotYet(s) => format!("not yet {s}"),
+                })
+                .collect()
+        };
+        let items = Archive::items(10..14, vec![cp(13), cp(10), cp(12)], false).unwrap();
+        assert_eq!(show(items), ["10", "missing 11", "12", "13"]);
+        // Past the archive's tip, what follows the last one held isn't missing: it isn't there yet.
+        let items = Archive::items(10..14, vec![cp(10), cp(12)], true).unwrap();
+        assert_eq!(show(items), ["10", "missing 11", "12", "not yet 13"]);
         // Outside the page, or twice: the archive misbehaved.
-        assert!(Archive::items(10..14, vec![cp(14)]).is_err());
-        assert!(Archive::items(10..14, vec![cp(10), cp(10)]).is_err());
-        assert!(Archive::items(10..14, vec![(None, Checkpoint::default())]).is_err());
+        assert!(Archive::items(10..14, vec![cp(14)], false).is_err());
+        assert!(Archive::items(10..14, vec![cp(10), cp(10)], false).is_err());
+        assert!(Archive::items(10..14, vec![(None, Checkpoint::default())], false).is_err());
     }
 
     /// Opt-in: archive backfill under a mask equals the gateway's render of

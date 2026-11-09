@@ -60,6 +60,7 @@ const onDiagnostic = (d: Streams.Diagnostic) =>
     Connect: () => void stats.connects++,
     Backfill: ({ from, to }) => void stats.backfills.push(`${t()}s ${from}..=${to}`),
     Disconnect: ({ reason, retryInMs }) => void stats.disconnects.push(`${t()}s ${reason.slice(0, 120)} (retry in ${retryInMs} ms)`),
+    ArchiveRetry: ({ reason, retryInMs }) => void stats.disconnects.push(`${t()}s archive: ${reason.slice(0, 120)} (retry in ${retryInMs} ms)`),
   });
 
 const iterator = items({ readMask: mask, from, onDiagnostic })[Symbol.asyncIterator]();

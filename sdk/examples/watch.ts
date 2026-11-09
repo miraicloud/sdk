@@ -39,6 +39,7 @@ const program = Effect.gen(function* () {
           Connect: () => undefined,
           Backfill: ({ from, to }) => console.error(`# reading ${from}..=${to} from the archive`),
           Disconnect: ({ reason, retryInMs }) => console.error(`# disconnected: ${reason} (retrying in ${retryInMs} ms)`),
+          ArchiveRetry: ({ reason, retryInMs }) => console.error(`# archive: ${reason} (retrying in ${retryInMs} ms)`),
         }),
     })
     .pipe(Stream.runForEach((item) => (item._tag === "Gap" ? Console.error(`# gap ${item.from}..=${item.to}`) : Console.log(line(item.seq, item.checkpoint)))));

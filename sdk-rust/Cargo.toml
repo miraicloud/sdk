@@ -1,6 +1,6 @@
 [package]
 name = "miraicloud"
-version = "0.1.1"
+version = "0.1.2"
 description = "The mirai.cloud SDK for Rust: Streams (the Sui checkpoint stream: ordered, resumable from any checkpoint, history from the Sui archive) and Sui-native delegation"
 edition = "2024"
 # Let chains need 1.88; dependencies (roaring, via sui-sdk-types) need 1.90.

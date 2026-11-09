@@ -186,7 +186,7 @@ impl Source for HttpSource {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.trim().parse::<u64>().ok())
-                    .map(Duration::from_secs);
+                    .map(|s| Duration::from_secs(s).min(crate::streams::driver::MAX_RETRY_AFTER));
                 let body = resp.text().await.unwrap_or_default();
                 // An exchanged token refused (revoked meanwhile, or a
                 // clock off): renew it once before giving up.

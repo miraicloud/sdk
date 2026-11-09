@@ -18,6 +18,7 @@ import { type CheckpointLike, type Decoder, Diagnostic, drive, type GapLike, typ
 import { CONTENT_TYPE, type Frame, FrameParser } from "./frame.js";
 import { resolveMask } from "./mask.js";
 import { authorize } from "./request.js";
+import { forget } from "../token.js";
 
 export { Diagnostic };
 
@@ -58,7 +59,12 @@ export interface ArchiveConfig {
   /**
    * A `SuiGrpcClient` with the history. Default: one over native gRPC
    * (`@grpc/grpc-js`) to `host`; the archive has no gRPC-web, so the
-   * default needs Node or Bun, not a browser.
+   * default needs Node or Bun, not a browser. A client of your own should
+   * enable HTTP/2 keepalive (`"grpc.keepalive_time_ms": 10_000`,
+   * `"grpc.keepalive_timeout_ms": 10_000` in its transport's
+   * `clientOptions`): without it, a connection that died silently (a
+   * network change) is noticed only when the OS gives up on it (~15 min);
+   * the default client has it, and is replaced after a call that stalls.
    */
   readonly client?: SuiGrpcClient | undefined;
   /** `host:port` when no `client` is given. Default `MAINNET_ARCHIVE`. */
@@ -96,7 +102,7 @@ export interface CheckpointStreamOptions {
    * Reconnect (resuming from the cursor) when a connection delivers no
    * checkpoint or gap for this long, even if keepalives still arrive: a
    * server that stays connected but stops sending checkpoints can't freeze
-   * the subscription. Default 60 000 (Mainnet makes ~4 checkpoints a second).
+   * the subscription. Default 30 000, inside the stream's ~49 s ring (Mainnet makes ~4 checkpoints a second).
    */
   readonly progressTimeoutMs?: number | undefined;
   /**
@@ -322,8 +328,6 @@ export interface SourceOptions {
   readonly zstdDecoder: ZstdDecoder | undefined;
   /** No bytes (keepalives included) for this long → reconnect. */
   readonly stallTimeoutMs: number;
-  /** No checkpoint or gap (keepalives don't count) for this long → reconnect. */
-  readonly progressTimeoutMs: number;
 }
 
 /**
@@ -332,6 +336,9 @@ export interface SourceOptions {
  * a deploy waits it out; a wrong URL is final after them.
  */
 export const NOT_FOUND_ATTEMPTS = 6;
+
+/** The most a server's `Retry-After` can make a subscription wait: shorter than the stream's ring (~49 s), so the wait never forces a backfill. */
+export const MAX_RETRY_AFTER_MS = 30_000;
 
 /**
  * A refused connection: final (`CheckpointStreamError`), too old (`TooOld`),
@@ -351,8 +358,9 @@ const refusal = (response: HttpClientResponse.HttpClientResponse, retryNotFound:
       if (typeof body === "object" && body !== null) ({ _tag: tag, message: detail } = body as { _tag?: unknown; message?: unknown });
     } catch {}
     const message = typeof detail === "string" ? detail : text.trim() !== "" ? text.trim() : `HTTP ${response.status}`;
-    const retryAfter = Number(response.headers["retry-after"]);
-    const retryAfterMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined;
+    // Whole seconds only (not `1e9`), capped: an absurd value can't park the subscription.
+    const retryAfterHeader = response.headers["retry-after"]?.trim();
+    const retryAfterMs = retryAfterHeader !== undefined && /^\d{1,9}$/.test(retryAfterHeader) && Number(retryAfterHeader) > 0 ? Math.min(Number(retryAfterHeader) * 1000, MAX_RETRY_AFTER_MS) : undefined;
     switch (response.status) {
       case 400:
         return yield* new Invalid({ message });
@@ -366,7 +374,7 @@ const refusal = (response: HttpClientResponse.HttpClientResponse, retryNotFound:
       case 410: {
         // Older than the stream holds, which starts here.
         const oldest = response.headers["oldest-checkpoint"]?.trim();
-        if (oldest !== undefined && /^\d+$/.test(oldest)) return yield* new TooOld({ message, oldest: BigInt(oldest) });
+        if (oldest !== undefined && /^\d{1,20}$/.test(oldest) && BigInt(oldest) < 2n ** 64n) return yield* new TooOld({ message, oldest: BigInt(oldest) });
         return yield* new Retry({ message: `HTTP 410: ${message}` });
       }
       case 429:
@@ -381,6 +389,9 @@ const refusal = (response: HttpClientResponse.HttpClientResponse, retryNotFound:
 export const httpSource = <C extends CheckpointLike, G extends GapLike>(options: SourceOptions, decode: Decoder<C, G>): LiveSource<C, G, CheckpointStreamError> => {
   let served = false;
   let notFound = 0;
+  // A delegated key refused (revoked meanwhile, or expired on a skewed
+  // clock): forget it and exchange again once before the 401 is final.
+  let renewedOn401 = false;
   return {
     connect: (after) =>
       Stream.unwrap(
@@ -417,8 +428,15 @@ export const httpSource = <C extends CheckpointLike, G extends GapLike>(options:
             Effect.mapError(failed("connect failed")),
             Effect.timeoutOrElse({ duration: stall, orElse: () => Effect.fail(noData()) }),
           );
+          if (response.status === 401 && options.auth._tag === "Delegated" && !renewedOn401) {
+            renewedOn401 = true;
+            forget(options.auth);
+            yield* response.text.pipe(Effect.ignore);
+            return yield* new Retry({ message: "HTTP 401: the delegated key was refused; exchanging a new one" });
+          }
           if (response.status !== 200) return yield* refusal(response, served || (response.status === 404 && ++notFound < NOT_FOUND_ATTEMPTS));
           served = true;
+          renewedOn401 = false;
           const reader = Stream.toReadableStream(response.stream).getReader();
           // The client may or may not have decoded the zstd body (Bun's fetch
           // and newer undici do; older undici and other clients pass it on).
@@ -455,12 +473,6 @@ export const httpSource = <C extends CheckpointLike, G extends GapLike>(options:
             Stream.timeoutOrElse({ duration: stall, orElse: () => Stream.fail(noData()) }),
             Stream.mapEffect((chunk) => Effect.try({ try: () => items(chunk), catch: failed("malformed frame") })),
             Stream.flattenIterable,
-            // The progress watchdog: as the stall timer, it runs only while
-            // the consumer is pulling.
-            Stream.timeoutOrElse({
-              duration: options.progressTimeoutMs,
-              orElse: () => Stream.fail(new Retry({ message: `no checkpoints for ${options.progressTimeoutMs} ms` })),
-            }),
           );
           // A delegated key: reconnect once a fresh one exists (resuming after the cursor: nothing lost).
           if (renew === undefined) return read;
@@ -478,7 +490,8 @@ const messageOf = (cause: unknown): string => (cause instanceof Error ? cause.me
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 const DEFAULT_STALL_MS = 45_000;
-const DEFAULT_PROGRESS_MS = 60_000;
+// Shorter than the stream's ring (~49 s): a watchdog reconnect still resumes from the stream.
+const DEFAULT_PROGRESS_MS = 30_000;
 
 /** Options, validated. */
 interface Resolved {
@@ -528,9 +541,15 @@ export const subscribe = <C extends CheckpointLike, G extends GapLike>(
     if (Result.isFailure(resolved)) return Stream.fail(resolved.failure);
     const r = resolved.success;
     const archive = options.archive ?? {};
-    const history = archive === false ? undefined : archiveHistory({ client: archive.client, host: archive.host, concurrency: archive.concurrency, readMask: r.readMask });
+    const history = archive === false ? undefined : archiveHistory({
+            client: archive.client,
+            host: archive.host,
+            concurrency: archive.concurrency,
+            readMask: r.readMask,
+            onRetry: (reason, retryInMs) => options.onDiagnostic?.(Diagnostic.ArchiveRetry({ reason, retryInMs })),
+          });
     const live = httpSource(
-      { ...connection, zstdDecoder: options.zstdDecoder ?? nativeZstdDecoder(), stallTimeoutMs: r.stallTimeoutMs, progressTimeoutMs: r.progressTimeoutMs },
+      { ...connection, zstdDecoder: options.zstdDecoder ?? nativeZstdDecoder(), stallTimeoutMs: r.stallTimeoutMs },
       r.readMask ? masked(decode, r.readMask) : decode,
     );
     return drive({
@@ -541,6 +560,7 @@ export const subscribe = <C extends CheckpointLike, G extends GapLike>(
       onDiagnostic: options.onDiagnostic,
       backoffBaseMs: BACKOFF_BASE_MS,
       backoffMaxMs: BACKOFF_MAX_MS,
+      progressTimeoutMs: r.progressTimeoutMs,
     }).pipe(Stream.ensuring(Effect.sync(() => history?.close?.())));
   });
 

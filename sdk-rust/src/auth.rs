@@ -394,6 +394,12 @@ impl Token {
 /// A token is not handed out this close to its expiry (at most a tenth of
 /// its lifetime).
 const MIN_VALIDITY: Duration = Duration::from_secs(5);
+/// A token whose lifetime measures as zero (a clock far off) is assumed to
+/// live this long (the server's shortest), its 401 renewing it if not.
+const MIN_ASSUMED_LIFETIME: Duration = Duration::from_secs(60);
+/// The shortest wait before renewing a token: renewals never spin, however
+/// short-lived the tokens (a chain about to expire caps them).
+const MIN_RENEWAL_INTERVAL: Duration = Duration::from_secs(1);
 /// After a failed renewal (with the old token still valid), wait this long
 /// before trying again.
 const RENEW_RETRY: Duration = Duration::from_secs(5);
@@ -663,11 +669,18 @@ impl TokenSource {
             None => local,
         };
         let lifetime = Duration::from_millis(u64::try_from(e.expires_at - server_now).unwrap_or(0));
-        if lifetime.is_zero() {
-            return Err(Error::Unavailable(
-                "the exchanged token has already expired (is the clock right?)".into(),
-            ));
-        }
+        // No usable lifetime (no Date header and a clock far off, or a Date
+        // far from the clock `expiresAt` is on): assume the server's
+        // minimum and let a 401 renew it, rather than never connecting.
+        let lifetime = if lifetime.is_zero() {
+            tracing::warn!(
+                ?lifetime,
+                "the exchanged token's lifetime can't be measured (is the clock right?); assuming {MIN_ASSUMED_LIFETIME:?}"
+            );
+            MIN_ASSUMED_LIFETIME
+        } else {
+            lifetime
+        };
         let o = &inner.options;
         // At most half the lifetime (short-lived tokens).
         let margin = o
@@ -680,7 +693,8 @@ impl TokenSource {
             id: e.id,
             expires_at: e.expires_at,
             ancestors: e.ancestors,
-            refresh_at: received + lifetime.saturating_sub(margin),
+            // At least a second from now: renewals can never spin.
+            refresh_at: received + lifetime.saturating_sub(margin).max(MIN_RENEWAL_INTERVAL),
             usable_until: received + lifetime - MIN_VALIDITY.min(lifetime / 10),
             expires: received + lifetime,
         })

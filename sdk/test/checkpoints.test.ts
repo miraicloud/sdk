@@ -354,7 +354,7 @@ describe("archive", () => {
   const collect = async (h: HistorySource, from: bigint, to: bigint) => {
     const out: string[] = [];
     for await (const i of Stream.toAsyncIterable(h.checkpoints(from, to))) {
-      out.push(i.type === "missing" ? `missing ${i.seq}` : `${i.seq} ${i.checkpoint.digest} ${i.checkpoint.objects?.objects.length ?? "-"}`);
+      out.push(i.type === "checkpoint" ? `${i.seq} ${i.checkpoint.digest} ${i.checkpoint.objects?.objects.length ?? "-"}` : `${i.type} ${i.seq}`);
     }
     return out;
   };
@@ -363,16 +363,18 @@ describe("archive", () => {
     const log: string[] = [];
     // Page 60 fails twice; 113 is absent on every ask.
     const client = fakeArchive({ fail: (start, n) => start === 60n && n <= 2, missing: (seq) => seq === 113n }, log);
-    const h = archiveHistory({ client, readMask: ["sequence_number", "digest"], concurrency: 3 });
+    const h = archiveHistory({ client, readMask: ["sequence_number", "digest"], concurrency: 3, shortRetryBaseMs: 1 });
     const out = await collect(h, 10n, 117n);
     expect(out.length).toBe(107);
     expect(out.slice(0, 2)).toEqual(["10 d10 -", "11 d11 -"]);
     expect(out.slice(102)).toEqual(["112 d112 -", "missing 113", "114 d114 -", "115 d115 -", "116 d116 -"]);
     expect(out.every((line, i) => line.startsWith(`${10 + i} `) || line === `missing ${10 + i}`)).toBe(true);
-    // Pages of 50 with explicit bounds; the failing page asked 3 times, the short one twice.
+    // Pages of 50 with explicit bounds; the failing page asked 3 times; the short one 6 times
+    // (5 times again before 113 counts as missing), the later asks continuing after what arrived.
     expect(log.filter((l) => l === "10-60").length).toBe(1);
     expect(log.filter((l) => l === "60-110").length).toBe(3);
-    expect(log.filter((l) => l === "110-117").length).toBe(2);
+    expect(log.filter((l) => l === "110-117").length).toBe(1);
+    expect(log.filter((l) => l === "113-117").length).toBe(5);
     // Full mask: no pruning.
     const full = archiveHistory({ client: fakeArchive({}, []), readMask: undefined });
     expect(await collect(full, 1n, 2n)).toEqual(["1 d1 1"]);
@@ -453,6 +455,7 @@ const run = async (mode: Mode, live: LiveSource<AnyCheckpoint, AnyGap, Invalid>,
     history,
     startAt: startAt === undefined ? undefined : BigInt(startAt),
     onDiagnostic,
+    progressTimeoutMs: 60_000,
     backoffBaseMs: 5,
     backoffMaxMs: 30,
     random: () => 1,
@@ -492,6 +495,30 @@ for (const mode of modes)
       expect(connects).toEqual(["99", "150", "153"]);
     });
 
+    test("a 410 far beyond the live tip is refused; a true one is believed once a probe confirms it", async () => {
+      // 1..3, then a 410 claiming u64::MAX - 2: the probe (at the tip: 5) refutes it.
+      let connects: (string | undefined)[] = [];
+      let src = scripted([{ items: [cp(1), cp(2), cp(3)], error: new Retry({ message: "cut" }) }, { items: [], error: tooOld(Number.MAX_SAFE_INTEGER) }, { items: [cp(5)] }, { items: [cp(4)] }], connects);
+      expect(await run(mode, src, 4, 1)).toEqual([1, 2, 3, 4]);
+      expect(connects).toEqual(["0", "3", undefined, "3"]);
+      // Back after a long absence: the oldest is far beyond the cursor, and true.
+      connects = [];
+      src = scripted([{ items: [], error: tooOld(50_000) }, { items: [cp(50_010)] }, { items: [cp(50_000)] }], connects);
+      expect(await run(mode, src, 2, 1)).toEqual(["gap 1-49999", 50_000]);
+      expect(connects).toEqual(["0", undefined, "49999"]);
+    });
+
+    test("a frame far beyond the live tip breaks the connection; one the tip confirms is kept", async () => {
+      let connects: (string | undefined)[] = [];
+      let src = scripted([{ items: [cp(1), gapItem(2, 2_000_000_000)] }, { items: [cp(3)] }, { items: [cp(2)] }], connects);
+      expect(await run(mode, src, 2, 1)).toEqual([1, 2]);
+      expect(connects).toEqual(["0", undefined, "1"]);
+      connects = [];
+      src = scripted([{ items: [cp(1), gapItem(2, 5_000), cp(5_001)] }, { items: [cp(5_001)] }], connects);
+      expect(await run(mode, src, 3, 1)).toEqual([1, "gap 2-5000", 5_001]);
+      expect(connects).toEqual(["0", undefined]);
+    });
+
     test("a gap overlapping the cursor is trimmed", async () => {
       expect(await run(mode, scripted([{ items: [cp(10), gapItem(5, 12), cp(13)] }], []), 3)).toEqual([10, "gap 11-12", 13]);
     });
@@ -522,7 +549,7 @@ for (const mode of modes)
       const fail = () => ({ items: [], error: new Retry({ message: "down" }) });
       const busy = { items: [], error: new Retry({ message: "429", retryAfterMs: 50 }) };
       const src = scripted([fail(), fail(), busy, { items: [cp(1)] }], []);
-      const items = drive({ live: src, decode: decoderOf(mode), startAt: undefined, onDiagnostic: (d) => diags.push(d), backoffBaseMs: 100, backoffMaxMs: 1_000, random: () => 0 });
+      const items = drive({ live: src, decode: decoderOf(mode), startAt: undefined, onDiagnostic: (d) => diags.push(d), backoffBaseMs: 100, backoffMaxMs: 1_000, random: () => 0, progressTimeoutMs: 60_000 });
       for await (const _ of Stream.toAsyncIterable(items)) break;
       const waits = diags.flatMap((d) => (d._tag === "Disconnect" ? [d.retryInMs] : []));
       expect(waits.slice(0, 3)).toEqual([50, 100, 200]);
@@ -539,7 +566,7 @@ for (const mode of modes)
       const out: (string | number)[] = [];
       let error: unknown;
       try {
-        for await (const item of Stream.toAsyncIterable(drive({ live: src, decode: decoderOf(mode), startAt: undefined, backoffBaseMs: 1, backoffMaxMs: 1 }))) {
+        for await (const item of Stream.toAsyncIterable(drive({ live: src, decode: decoderOf(mode), startAt: undefined, backoffBaseMs: 1, backoffMaxMs: 1, progressTimeoutMs: 60_000 }))) {
           out.push(checked(mode, item));
         }
       } catch (e) {
@@ -881,7 +908,6 @@ describe("http source", () => {
     auth: Auth.None(),
     zstdDecoder: undefined,
     stallTimeoutMs: 1000,
-    progressTimeoutMs: 60_000,
     ...extra,
   });
   const drain = (src: ReturnType<typeof httpSource<AnyCheckpoint, AnyGap>>, after?: bigint) => Effect.runPromiseExit(Stream.runCollect(src.connect(after)));

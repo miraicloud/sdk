@@ -45,15 +45,28 @@ pub(crate) struct Deadlines {
 impl Default for Deadlines {
     fn default() -> Self {
         Deadlines {
-            progress: Duration::from_secs(60),
+            // Shorter than the stream's ring (~49 s): a watchdog reconnect
+            // still resumes from the stream, not the archive.
+            progress: Duration::from_secs(30),
             connect: Duration::from_secs(60),
             tip: Duration::from_secs(15),
-            history_item: Duration::from_secs(150),
+            // A backstop only, past the archive client's own per-call limit:
+            // stalls are caught there (30 s to the first response, 30 s
+            // between messages); a slow but working link must not lose its
+            // page here (at 90 s, a throttled link delivered nothing).
+            history_item: Duration::from_secs(660),
         }
     }
 }
 
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
+/// The shortest time between two connections when the first ended to renew
+/// its token (tokens that live a fraction of a second can't make a storm).
+const MIN_RENEW_RECONNECT: Duration = Duration::from_secs(1);
+/// The most a server's `Retry-After` can make a subscription wait: shorter
+/// than the stream's ring (~49 s), so the wait never forces a backfill, and
+/// an absurd value can't park it.
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 fn backoff(failures: u32) -> Duration {
@@ -153,6 +166,62 @@ impl Item for RawEvent {
     }
 }
 
+/// Positions within this of the highest known one (seen from the server,
+/// or the start) are believed as they are: a 410's oldest after a short
+/// absence, a gap after an ingest outage (`maxHole` is 1,000).
+const NEAR: u64 = 1_000;
+/// A claimed position may be this far past the live tip a probe saw (the
+/// chain moves on meanwhile).
+const TIP_SLACK: u64 = 100;
+
+/// The live tip, from the first frame of a connection opened at the tip:
+/// how a position far beyond anything known is checked (a 410's oldest, or
+/// a frame), without guessing from elapsed time (which a laptop sleep or a
+/// clock step breaks) or from the archive (which can lag). `None`: no
+/// answer within the deadlines.
+async fn probe_tip(source: &dyn Source, deadlines: Deadlines) -> Option<u64> {
+    let Ok(Ok(mut events)) = tokio::time::timeout(deadlines.connect, source.connect(None)).await
+    else {
+        return None;
+    };
+    match tokio::time::timeout(deadlines.progress, events.next()).await {
+        Ok(Some(Ok(StreamEvent::Checkpoint(seq, _)))) => Some(seq),
+        Ok(Some(Ok(StreamEvent::Gap { to, .. }))) => Some(to),
+        _ => None,
+    }
+}
+
+/// Whether position `claimed` can be true, given `known` (the highest
+/// position known). Near it: yes. Beyond: only if a probe of the live tip
+/// confirms it (`tip`: the probe's answer, asked at most once per
+/// connection; `Some(None)`: asked, no answer, so not believed).
+async fn believable(
+    claimed: u64,
+    known: Option<u64>,
+    source: &dyn Source,
+    deadlines: Deadlines,
+    tip: &mut Option<Option<u64>>,
+) -> bool {
+    if known.is_some_and(|k| claimed <= k.saturating_add(NEAR)) {
+        return true;
+    }
+    if tip.is_none() {
+        *tip = Some(probe_tip(source, deadlines).await);
+    }
+    matches!(*tip, Some(Some(t)) if claimed <= t.saturating_add(TIP_SLACK))
+}
+
+/// The archive's tip, or `None` if it doesn't answer within `deadlines.tip`.
+async fn archive_tip(history: &dyn History, deadlines: Deadlines) -> Option<u64> {
+    match tokio::time::timeout(deadlines.tip, history.tip()).await {
+        Ok(tip) => tip,
+        Err(_) => {
+            tracing::warn!(after = ?deadlines.tip, "archive tip: no answer");
+            None
+        }
+    }
+}
+
 /// Read from `next` up to history's tip (at least to `oldest`, the ring's
 /// first position) into `out`, in order. Returns the new `next`, and whether
 /// it got there (else: retry after backoff). Only a missing run followed by
@@ -166,13 +235,12 @@ async fn backfill<E: Item>(
 ) -> Option<(u64, bool)> {
     // An unknown tip (or one that doesn't answer in time): up to the ring,
     // as far as is known to be needed.
-    let tip = match tokio::time::timeout(deadlines.tip, history.tip()).await {
-        Ok(tip) => tip,
-        Err(_) => {
-            tracing::warn!(after = ?deadlines.tip, "archive tip: no answer; backfilling up to the stream's oldest");
-            None
-        }
-    };
+    let tip = archive_tip(history, deadlines).await;
+    // Up to the tip, or the ring if the tip lags it. Pages past what the
+    // archive holds end at the first `LEDGER_TIP` (`NotYet`), and a 410
+    // can't claim an oldest beyond where the chain can be
+    // (`plausible_oldest`), so a lying tip or oldest can't make this walk
+    // empty pages for minutes.
     let end = tip.map_or(oldest, |tip| (tip + 1).max(oldest));
     tracing::info!(from = next, to = end - 1, "backfilling from the archive");
     let mut items = history.checkpoints(next..end);
@@ -202,6 +270,11 @@ async fn backfill<E: Item>(
                 tracing::warn!(next, "archive backfill failed: {e}");
                 return Some((next, false));
             }
+            // The rest is past the archive's tip: stop (trailing missing ones aren't gaps).
+            Some(Ok(HistoryItem::NotYet(seq))) => {
+                tracing::debug!(seq, "past the archive's tip");
+                break;
+            }
             Some(Ok(HistoryItem::Missing(seq))) => {
                 // `next` moves past it only once it is reported as a gap.
                 missing = Some(match missing {
@@ -224,7 +297,12 @@ async fn backfill<E: Item>(
         tracing::info!(from = a, to = b, "not in the archive yet");
         return Some((a, a >= oldest));
     }
-    Some((next, true))
+    // Short of the stream's oldest (the archive lags it): back off before
+    // asking the stream again, rather than spin.
+    if next < oldest {
+        tracing::info!(next, oldest, "the archive is behind the stream; retrying");
+    }
+    Some((next, next >= oldest))
 }
 
 /// `start`: first checkpoint wanted (`None` = live tip). `history`: where
@@ -243,8 +321,23 @@ pub(crate) async fn run<E: Item>(
     let mut next = start;
     // Consecutive connections that delivered nothing.
     let mut failures = 0u32;
+    // The highest position known (delivered, the start, an accepted
+    // Oldest-Checkpoint, or a probed tip): what a 410 or a frame may claim
+    // without a probe (`believable`).
+    let mut known: Option<u64> = start.and_then(|s| s.checked_sub(1));
+    // When the last connection opened: reconnecting to renew a token waits
+    // until a second after it (very short-lived tokens can't make a storm).
+    let mut connected_at: Option<tokio::time::Instant> = None;
     'connect: loop {
         let mut delay = None;
+        if let Some(at) = connected_at.take() {
+            tokio::select! {
+                _ = tokio::time::sleep_until(at + MIN_RENEW_RECONNECT) => {}
+                _ = out.closed() => return,
+            }
+        }
+        // The live tip, if probed while judging this connection (at most once).
+        let mut tip: Option<Option<u64>> = None;
         let connected = tokio::select! {
             r = tokio::time::timeout(deadlines.connect, source.connect(next)) => r,
             _ = out.closed() => return,
@@ -260,11 +353,29 @@ pub(crate) async fn run<E: Item>(
                 let _ = out.send(Err(e)).await;
                 return;
             }
-            Err(ConnError::TooOld { oldest }) => match next.filter(|&n| n < oldest) {
-                // Not actually older (e.g. a misbehaving proxy): back off.
-                None => tracing::warn!(?next, oldest, "unexpected 410"),
-                Some(n) => match &history {
-                    None => {
+            Err(ConnError::TooOld { oldest })
+                if !believable(oldest, known, source.as_ref(), deadlines, &mut tip).await =>
+            {
+                // Beyond the live tip (a proxy's or a buggy server's value):
+                // believing it would report a gap that never happened and
+                // skip there. Back off and ask again.
+                tracing::warn!(
+                    ?next,
+                    oldest,
+                    ?known,
+                    ?tip,
+                    "implausible Oldest-Checkpoint; retrying"
+                );
+            }
+            Err(ConnError::TooOld { oldest }) => {
+                known = Some(known.map_or(oldest, |k| k.max(oldest)));
+                if let Some(Some(t)) = tip {
+                    known = Some(known.map_or(t, |k| k.max(t)));
+                }
+                match (next.filter(|&n| n < oldest), &history) {
+                    // Not actually older (e.g. a misbehaving proxy): back off.
+                    (None, _) => tracing::warn!(?next, oldest, "unexpected 410"),
+                    (Some(n), None) => {
                         tracing::warn!(
                             from = n,
                             to = oldest - 1,
@@ -277,45 +388,49 @@ pub(crate) async fn run<E: Item>(
                         failures = 0;
                         continue;
                     }
-                    Some(h) => match backfill(h.as_ref(), n, oldest, &out, deadlines).await {
-                        None => return,
-                        Some((reached, done)) => {
-                            if reached > n {
-                                failures = 0;
-                            }
-                            next = Some(reached);
-                            if done {
-                                // Close to the ring now: reconnect right away.
-                                continue;
+                    (Some(n), Some(h)) => {
+                        match backfill(h.as_ref(), n, oldest, &out, deadlines).await {
+                            None => return,
+                            Some((reached, done)) => {
+                                if reached > n {
+                                    failures = 0;
+                                }
+                                next = Some(reached);
+                                if done {
+                                    // Close to the ring now: reconnect right away.
+                                    continue;
+                                }
                             }
                         }
-                    },
-                },
-            },
+                    }
+                }
+            }
             Err(ConnError::Retry(msg, retry_after)) => {
                 tracing::warn!("stream connection failed: {msg}");
                 delay = retry_after;
             }
-            Err(ConnError::Renew) => continue,
+            Err(ConnError::Renew) => {
+                connected_at = Some(tokio::time::Instant::now());
+                continue;
+            }
             Ok(mut events) => {
                 tracing::debug!(?next, "connected");
-                // The progress watchdog: reset by each checkpoint or gap
-                // received (duplicates included: the server is moving), not
-                // by keepalives, and not while the consumer is slow to take
-                // what was delivered.
+                let opened = tokio::time::Instant::now();
+                // The progress watchdog: reset only when the cursor moves (a
+                // checkpoint or gap delivered), never by keepalives or by
+                // replays of what was already delivered, and not while the
+                // consumer is slow to take what was delivered.
                 let mut progress_by = tokio::time::Instant::now() + deadlines.progress;
+                let mut replays = 0u64;
                 loop {
                     let item = tokio::select! {
                         item = events.next() => item,
                         _ = tokio::time::sleep_until(progress_by) => {
-                            tracing::warn!(?next, after = ?deadlines.progress, "no checkpoints on this connection; reconnecting");
+                            tracing::warn!(?next, after = ?deadlines.progress, replays, "no new checkpoints on this connection; reconnecting");
                             break;
                         }
                         _ = out.closed() => return,
                     };
-                    if matches!(item, Some(Ok(_))) {
-                        progress_by = tokio::time::Instant::now() + deadlines.progress;
-                    }
                     let event = match item {
                         None => {
                             tracing::debug!(?next, "stream closed by server");
@@ -330,6 +445,7 @@ pub(crate) async fn run<E: Item>(
                             // Before the token expires: the server never
                             // has to cut the stream.
                             tracing::debug!(?next, "renewing the connection's token");
+                            connected_at = Some(opened);
                             continue 'connect;
                         }
                         Some(Err(ConnError::Fatal(e))) => {
@@ -338,9 +454,46 @@ pub(crate) async fn run<E: Item>(
                         }
                         Some(Ok(event)) => event,
                     };
+                    // A gap must be a range, and nothing can follow u64::MAX.
+                    let malformed = match &event {
+                        StreamEvent::Gap { from, to } => from > to || *to == u64::MAX,
+                        StreamEvent::Checkpoint(seq, _) => *seq == u64::MAX,
+                    };
+                    if malformed {
+                        tracing::warn!(
+                            ?next,
+                            "malformed frame (an empty gap, or u64::MAX); reconnecting"
+                        );
+                        break;
+                    }
+                    // A frame far beyond anything known (a gap's end, or a
+                    // checkpoint) must be confirmed by the live tip: taken
+                    // as it is, it would move the cursor there for good.
+                    let at = match &event {
+                        StreamEvent::Gap { to, .. } => *to,
+                        StreamEvent::Checkpoint(seq, _) => *seq,
+                    };
+                    if known.is_some()
+                        && !believable(at, known, source.as_ref(), deadlines, &mut tip).await
+                    {
+                        tracing::warn!(
+                            ?next,
+                            at,
+                            ?known,
+                            ?tip,
+                            "a frame beyond the live tip; reconnecting"
+                        );
+                        break;
+                    }
                     let event = match (event, next) {
-                        (StreamEvent::Checkpoint(seq, _), Some(n)) if seq < n => continue,
-                        (StreamEvent::Gap { to, .. }, Some(n)) if to < n => continue,
+                        (StreamEvent::Checkpoint(seq, _), Some(n)) if seq < n => {
+                            replays += 1;
+                            continue;
+                        }
+                        (StreamEvent::Gap { to, .. }, Some(n)) if to < n => {
+                            replays += 1;
+                            continue;
+                        }
                         (StreamEvent::Checkpoint(seq, _), Some(n))
                         | (StreamEvent::Gap { from: seq, .. }, Some(n))
                             if seq > n =>
@@ -368,6 +521,9 @@ pub(crate) async fn run<E: Item>(
                         }
                     };
                     failures = 0;
+                    if let Some(n) = next {
+                        known = Some(known.map_or(n - 1, |k| k.max(n - 1)));
+                    }
                     if out.send(Ok(event)).await.is_err() {
                         return;
                     }
@@ -376,7 +532,7 @@ pub(crate) async fn run<E: Item>(
                 }
             }
         }
-        let wait = jittered(backoff(failures)).max(delay.unwrap_or_default());
+        let wait = jittered(backoff(failures)).max(delay.unwrap_or_default().min(MAX_RETRY_AFTER));
         failures += 1;
         tracing::info!(?wait, ?next, "reconnecting");
         tokio::select! {
@@ -685,7 +841,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn renewal_reconnects_at_once_from_the_cursor() {
+    async fn renewal_reconnects_from_the_cursor_without_backoff_at_most_once_a_second() {
         for raw in [false, true] {
             let t0 = tokio::time::Instant::now();
             let conns = vec![
@@ -700,11 +856,14 @@ mod tests {
             };
             assert_eq!(got, ["1", "2", "3", "4"]);
             assert_eq!(resumes, [Some(1), Some(3), Some(4)]);
-            // No backoff between renewals.
+            // No backoff between renewals; at most a second from when the
+            // renewed connection opened (tokens living a fraction of a second
+            // can't make a storm).
+            let elapsed = t0.elapsed();
             assert!(
-                t0.elapsed() < Duration::from_millis(100),
-                "{:?}",
-                t0.elapsed()
+                elapsed >= MIN_RENEW_RECONNECT * 2
+                    && elapsed < MIN_RENEW_RECONNECT * 2 + Duration::from_millis(100),
+                "{elapsed:?}"
             );
         }
     }
@@ -998,8 +1157,10 @@ mod tests {
         .await;
         assert_eq!(got, ["1", "2", "3", "4"]);
         assert_eq!(resumes, [Some(1), Some(2), Some(4)]);
+        // This history has no deadlines of its own, so the driver's backstop
+        // ends the stall; the real archive client ends one in 30 s itself.
         assert!(
-            started.elapsed() <= Duration::from_secs(5 * 60),
+            started.elapsed() <= Deadlines::default().history_item + Duration::from_secs(60),
             "{:?}",
             started.elapsed()
         );
@@ -1061,7 +1222,7 @@ mod tests {
         assert_eq!(&source.resumes.lock().unwrap()[..2], [Some(1), Some(2)]);
         let waited = started.elapsed();
         assert!(
-            waited >= Duration::from_secs(60) && waited < Duration::from_secs(120),
+            waited >= Duration::from_secs(30) && waited < Duration::from_secs(60),
             "{waited:?}"
         );
     }
@@ -1107,5 +1268,162 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    // Round 1 of the adversarial tests (2026-11-08).
+
+    #[tokio::test(start_paused = true)]
+    async fn replays_of_delivered_checkpoints_are_not_progress() {
+        // 1, 2, then 2 over and over on an open connection: the watchdog
+        // still fires and the next connection continues from 3.
+        struct Replaying(Mutex<u32>, Mutex<Vec<Option<u64>>>);
+        impl Source for Replaying {
+            fn connect(
+                &self,
+                next: Option<u64>,
+            ) -> BoxFuture<'static, Result<EventStream, ConnError>> {
+                self.1.lock().unwrap().push(next);
+                let n = {
+                    let mut n = self.0.lock().unwrap();
+                    *n += 1;
+                    *n
+                };
+                Box::pin(async move {
+                    if n == 1 {
+                        let replays = futures::stream::unfold((), |()| async {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            Some((cp(2), ()))
+                        });
+                        Ok(futures::stream::iter(vec![cp(1), cp(2)])
+                            .chain(replays)
+                            .boxed())
+                    } else {
+                        Ok(futures::stream::iter(vec![cp(3)]).boxed())
+                    }
+                })
+            }
+        }
+        let source = Arc::new(Replaying(Mutex::new(0), Mutex::new(vec![])));
+        let started = tokio::time::Instant::now();
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(run::<Event>(
+            source.clone(),
+            None,
+            Some(1),
+            None,
+            tx,
+            Deadlines::default(),
+        ));
+        let mut got = vec![];
+        while got.len() < 3 {
+            got.push(rx.recv().await.unwrap().unwrap().show());
+        }
+        task.abort();
+        assert_eq!(got, ["1", "2", "3"]);
+        assert_eq!(&source.1.lock().unwrap()[..2], [Some(1), Some(3)]);
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_absurd_retry_after_is_capped() {
+        let started = tokio::time::Instant::now();
+        let (got, _) = play::<Event>(
+            Some(1),
+            vec![
+                Err(ConnError::Retry(
+                    "503".into(),
+                    Some(Duration::from_secs(1_000_000_000)),
+                )),
+                Ok(vec![cp(1)]),
+            ],
+            1,
+        )
+        .await;
+        assert_eq!(got, ["1"]);
+        let waited = started.elapsed();
+        assert!(
+            waited >= MAX_RETRY_AFTER && waited < MAX_RETRY_AFTER + Duration::from_secs(5),
+            "{waited:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_implausible_oldest_checkpoint_is_not_believed() {
+        // 1..3 delivered, then a 410 claiming the ring starts at u64::MAX - 1:
+        // a probe of the live tip (5) refutes it: no gap, no skip.
+        let (got, resumes) = play::<Event>(
+            Some(1),
+            vec![
+                Ok(vec![cp(1), cp(2), cp(3)]),
+                Err(too_old(u64::MAX - 1)),
+                Ok(vec![cp(5)]), // the probe, at the tip
+                Ok(vec![cp(4)]),
+            ],
+            4,
+        )
+        .await;
+        assert_eq!(got, ["1", "2", "3", "4"]);
+        assert_eq!(resumes, [Some(1), Some(4), None, Some(4)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_far_oldest_checkpoint_is_believed_once_the_live_tip_confirms_it() {
+        // A client back after a long absence (a laptop sleep: no clock to go
+        // by): the 410's oldest is far beyond its cursor, and true.
+        let (got, resumes) = play::<Event>(
+            Some(1),
+            vec![
+                Err(too_old(50_000)),
+                Ok(vec![cp(50_010)]), // the probe
+                Ok(vec![cp(50_000)]),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(got, ["gap 1-49999", "50000"]);
+        assert_eq!(resumes, [Some(1), None, Some(50_000)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_beyond_the_live_tip_is_refused_and_a_confirmed_one_kept() {
+        // A gap ending far beyond the tip would move the cursor there for good.
+        let (got, resumes) = play::<Event>(
+            Some(1),
+            vec![
+                Ok(vec![cp(1), gap(2, 2_000_000_000)]),
+                Ok(vec![cp(3)]), // the probe
+                Ok(vec![cp(2)]),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(got, ["1", "2"]);
+        assert_eq!(resumes, [Some(1), None, Some(2)]);
+        // A large gap the tip confirms (an ingest outage) is delivered.
+        let (got, resumes) = play::<Event>(
+            Some(1),
+            vec![
+                Ok(vec![cp(1), gap(2, 5_000), cp(5_001)]),
+                Ok(vec![cp(5_001)]),
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(got, ["1", "gap 2-5000", "5001"]);
+        assert_eq!(resumes, [Some(1), None]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_gaps_and_the_last_sequence_number_reconnect() {
+        for bad in [gap(5, 3), gap(3, u64::MAX), cp(u64::MAX)] {
+            let (got, resumes) =
+                play::<Event>(Some(1), vec![Ok(vec![cp(1), bad]), Ok(vec![cp(2)])], 2).await;
+            assert_eq!(got, ["1", "2"]);
+            assert_eq!(resumes, [Some(1), Some(2)]);
+        }
     }
 }

@@ -11,7 +11,7 @@ You need an API key with the `stream:read` scope (`miraicloud keys create --name
 Not on crates.io yet; depend on a release tag of the repository (Rust 1.90 or newer):
 
 ```toml
-miraicloud = { git = "https://github.com/miraicloud/sdk", tag = "rust-v0.1.1" }
+miraicloud = { git = "https://github.com/miraicloud/sdk", tag = "rust-v0.1.2" }
 ```
 
 Checkpoints are `sui-rpc` 0.4's types (`miraicloud::streams::Checkpoint`); if you also depend on `sui-rpc`, use the same version.
