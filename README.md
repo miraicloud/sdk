@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **Archived (2026-11-23).** These SDKs are no longer maintained. mirai.cloud's endpoint, `https://api.mainnet.mirai.cloud`, is a drop-in for a Sui full node's gRPC API, so use the stock Sui SDKs with your API key as `authorization: Bearer <key>`: [`@mysten/sui`](https://www.npmjs.com/package/@mysten/sui) (`SuiGrpcClient`) for TypeScript, [`sui-rpc`](https://crates.io/crates/sui-rpc) for Rust, or any gRPC client. Live data is gRPC `SubscriptionService`; the checkpoint stream these SDKs read (`/v1/stream/checkpoints`) no longer exists. API keys and agent delegations are managed with the `miraicloud` CLI. See [docs.mirai.cloud](https://docs.mirai.cloud).
+
 # mirai.cloud SDKs
 
 Sign in with a Sui wallet, manage API keys and delegations, and stream Sui checkpoints from [mirai.cloud](https://mirai.cloud).
